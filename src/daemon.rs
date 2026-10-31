@@ -1,6 +1,7 @@
 use crate::engine::{default_exclude, AppDelta, Engine, Sample};
 use crate::frame::{read_magic, read_sample, FrameError};
 use crate::ifaces::local_prefixes;
+use crate::live::LiveWindow;
 use crate::procpath::image_path;
 use crate::store::Store;
 use serde::Serialize;
@@ -9,6 +10,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -46,6 +48,8 @@ pub fn run_daemon(db: &Path) -> Result<(), String> {
     }
 
     let store = Store::open(db).map_err(|err| err.to_string())?;
+    let live = Arc::new(Mutex::new(LiveWindow::new()));
+    crate::ipc::serve(db, Arc::clone(&live))?;
     let mut engine = Engine::new(default_exclude());
     let mut paths = PathCache::default();
     let mut pending = Pending::default();
@@ -66,6 +70,7 @@ pub fn run_daemon(db: &Path) -> Result<(), String> {
             &mut pending,
             &mut last_flush,
             &mut last_flush_unix,
+            &live,
         ) {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -120,6 +125,7 @@ fn supervise(
     pending: &mut Pending,
     last_flush: &mut Instant,
     last_flush_unix: &mut Option<u64>,
+    live: &Mutex<LiveWindow>,
 ) -> Result<(), String> {
     let meter = meter_path();
     if !meter.exists() {
@@ -188,6 +194,9 @@ fn supervise(
             entry.0 += encap_rx;
             entry.1 += encap_tx;
         }
+        if let Ok(mut window) = live.lock() {
+            window.push(unix_now(), &apps);
+        }
         pending.apps.extend(apps);
         write_status(db, "up", count, *last_flush_unix);
         if last_flush.elapsed() >= Duration::from_secs(30) {
@@ -226,7 +235,8 @@ fn flush_pending(
     }
     let now = unix_now();
     *last_flush_unix = Some(now);
-    if let Some(count) = sockets {
+    let count = sockets.unwrap_or(0);
+    if sockets.is_some() || meter == "down" {
         write_status(db, meter, count, *last_flush_unix);
     }
     Ok(())

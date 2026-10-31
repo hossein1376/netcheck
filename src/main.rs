@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use netcheck::{
-    default_db_path, min_hour, parse_since, run_daemon, status_path, Store, UsageRow,
+    default_db_path, fetch_top, install, meter_path, min_hour, parse_since, run_daemon, status_path,
+    uninstall, Store, UsageRow,
 };
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -35,6 +36,17 @@ enum Cmd {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// Show off-machine usage over the last minute.
+    Top {
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install a LaunchAgent for this user.
+    Install,
+    /// Stop the LaunchAgent and remove its binaries.
+    Uninstall,
 }
 
 fn main() {
@@ -58,6 +70,14 @@ fn main() {
             show_status(&db);
             Ok(())
         }
+        Cmd::Top { db, json } => {
+            let db = db.unwrap_or_else(default_db_path);
+            show_top(&db, json)
+        }
+        Cmd::Install => std::env::current_exe()
+            .map_err(|err| err.to_string())
+            .and_then(|bin| install(&bin, &meter_path(), &default_db_path())),
+        Cmd::Uninstall => uninstall(),
     };
     if let Err(err) = result {
         eprintln!("{err}");
@@ -108,6 +128,35 @@ fn show_usage(
         );
     }
     println!("Off-machine is internet plus unscoped. Hours overlap the window.");
+    Ok(())
+}
+
+fn show_top(db: &std::path::Path, json: bool) -> Result<(), String> {
+    let report = fetch_top(db)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        return Ok(());
+    }
+    if report.rows.is_empty() {
+        println!("No off-machine usage in the last minute.");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:>12} {:>12} {:>12} {:>12}",
+        "APP", "DOWN", "UP", "DOWN/s", "UP/s"
+    );
+    let secs = report.window_secs.max(1);
+    for row in &report.rows {
+        println!(
+            "{:<24} {:>12} {:>12} {:>12} {:>12}",
+            clip(&row.display_name, 24),
+            fmt_bytes(row.rx),
+            fmt_bytes(row.tx),
+            fmt_bytes(row.rx / secs),
+            fmt_bytes(row.tx / secs),
+        );
+    }
+    println!("Last {secs}s. Off-machine is internet plus unscoped.");
     Ok(())
 }
 
