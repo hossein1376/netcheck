@@ -10,7 +10,6 @@ mod ifaces;
 mod install;
 mod ipc;
 mod live;
-mod procpath;
 mod query;
 mod store;
 

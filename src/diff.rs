@@ -1,62 +1,46 @@
-use crate::frame::{Proto, SocketCount};
+use crate::frame::SocketCount;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A meter source. Ids are unique within one meter run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    pub pid: u32,
-    pub start_time: u64,
-    pub proto: Proto,
-    pub local: Option<SocketAddr>,
-    pub remote: Option<SocketAddr>,
+    pub source: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Delta {
     pub rx: u64,
     pub tx: u64,
-    /// True the first time this flow is seen. `rx` and `tx` are zero then.
+    /// True the first time a pre-existing flow is seen. `rx` and `tx` are zero then.
     pub fresh: bool,
 }
 
-#[derive(Debug)]
+/// Turns cumulative counters into deltas. Use one per meter run.
+#[derive(Debug, Default)]
 pub struct Diff {
     prev: HashMap<FlowKey, (u64, u64)>,
-    /// Unix seconds when watching began. Older processes are baselined.
-    watch_start: u64,
 }
 
 impl Diff {
     pub fn new() -> Self {
-        let watch_start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Self {
-            prev: HashMap::new(),
-            watch_start,
-        }
+        Self::default()
     }
 
     pub fn key_of(sock: &SocketCount) -> FlowKey {
         FlowKey {
-            pid: sock.pid,
-            start_time: sock.start_time,
-            proto: sock.proto,
-            local: sock.local,
-            remote: sock.remote,
+            source: sock.source,
         }
     }
 
-    /// Observe one cumulative counter. The first sight emits a zero delta.
+    /// Observe one cumulative counter.
     pub fn observe(&mut self, sock: &SocketCount) -> Delta {
         let key = Self::key_of(sock);
         let Some((prev_rx, prev_tx)) = self.prev.get(&key).copied() else {
             self.prev.insert(key, (sock.rx, sock.tx));
-            // A process that started with the daemon has no pre-watch history.
-            // Its first sample is the usage so far, including a transfer that
-            // finishes inside one poll.
-            if sock.start_time > 0 && sock.start_time.saturating_add(2) >= self.watch_start {
+            // A socket opened after the meter started has no history before
+            // the watch. Its counters so far are usage, including a transfer
+            // that finishes inside one poll.
+            if sock.new {
                 return Delta {
                     rx: sock.rx,
                     tx: sock.tx,
@@ -95,9 +79,12 @@ impl Diff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::Proto;
 
     fn sock(rx: u64, tx: u64) -> SocketCount {
         SocketCount {
+            source: 1,
+            new: false,
             pid: 7,
             start_time: 10,
             proto: Proto::Tcp,
@@ -106,14 +93,26 @@ mod tests {
             remote: Some("1.1.1.1:443".parse().unwrap()),
             rx,
             tx,
+            path: None,
         }
     }
 
     #[test]
-    fn first_sight_is_a_baseline() {
+    fn first_sight_of_an_old_socket_is_a_baseline() {
         let mut diff = Diff::new();
         let delta = diff.observe(&sock(50_000, 1_000));
         assert_eq!(delta, Delta { rx: 0, tx: 0, fresh: true });
+    }
+
+    #[test]
+    fn first_sight_of_a_new_socket_is_all_usage() {
+        let mut diff = Diff::new();
+        let mut born = sock(50_000, 1_000);
+        born.new = true;
+        let delta = diff.observe(&born);
+        assert_eq!(delta, Delta { rx: 50_000, tx: 1_000, fresh: false });
+        born.rx = 50_400;
+        assert_eq!(diff.observe(&born).rx, 400);
     }
 
     #[test]
@@ -125,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_is_a_reused_socket() {
+    fn a_drop_is_a_reset_counter() {
         let mut diff = Diff::new();
         diff.observe(&sock(50_000, 1_000));
         let delta = diff.observe(&sock(100, 40));
@@ -133,14 +132,13 @@ mod tests {
     }
 
     #[test]
-    fn a_new_start_time_is_a_new_flow() {
+    fn an_address_change_keeps_the_flow() {
         let mut diff = Diff::new();
         diff.observe(&sock(50_000, 1_000));
-        let mut reused = sock(50_000, 1_000);
-        reused.start_time = 11;
-        let delta = diff.observe(&reused);
-        assert!(delta.fresh);
-        assert_eq!(delta.rx, 0);
+        let mut moved = sock(50_300, 1_000);
+        moved.remote = Some("8.8.8.8:443".parse().unwrap());
+        let delta = diff.observe(&moved);
+        assert_eq!(delta, Delta { rx: 300, tx: 0, fresh: false });
     }
 
     #[test]

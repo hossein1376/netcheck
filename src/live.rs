@@ -21,6 +21,8 @@ pub struct TopReport {
 #[derive(Debug, Default)]
 pub struct LiveWindow {
     ticks: VecDeque<Tick>,
+    /// First sample time. Rates cover the window, or less right after start.
+    started: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -35,6 +37,7 @@ impl LiveWindow {
     }
 
     pub fn push(&mut self, unix: u64, apps: &[AppDelta]) {
+        self.started.get_or_insert(unix);
         let rows: Vec<TopRow> = apps
             .iter()
             .filter_map(|app| {
@@ -61,9 +64,7 @@ impl LiveWindow {
     pub fn snapshot(&mut self, now: u64) -> TopReport {
         self.expire(now);
         let mut totals: HashMap<String, TopRow> = HashMap::new();
-        let mut oldest = now;
         for tick in &self.ticks {
-            oldest = oldest.min(tick.unix);
             for row in &tick.rows {
                 let total = totals.entry(row.app_key.clone()).or_insert_with(|| TopRow {
                     app_key: row.app_key.clone(),
@@ -76,10 +77,9 @@ impl LiveWindow {
                 total.tx += row.tx;
             }
         }
-        let window_secs = if self.ticks.is_empty() {
-            WINDOW_SECS
-        } else {
-            (now.saturating_sub(oldest) + 1).clamp(1, WINDOW_SECS)
+        let window_secs = match self.started {
+            Some(started) => (now.saturating_sub(started) + 1).clamp(1, WINDOW_SECS),
+            None => WINDOW_SECS,
         };
         let mut rows: Vec<TopRow> = totals.into_values().collect();
         rows.sort_by(|a, b| (b.rx + b.tx).cmp(&(a.rx + a.tx)).then(a.display_name.cmp(&b.display_name)));
@@ -90,7 +90,7 @@ impl LiveWindow {
         while self
             .ticks
             .front()
-            .is_some_and(|tick| now.saturating_sub(tick.unix) > WINDOW_SECS)
+            .is_some_and(|tick| now.saturating_sub(tick.unix) >= WINDOW_SECS)
         {
             self.ticks.pop_front();
         }
@@ -125,6 +125,16 @@ mod tests {
         assert_eq!(report.rows[0].rx, 150);
         assert_eq!(report.rows[0].tx, 15);
         assert_eq!(report.window_secs, 31);
+    }
+
+    #[test]
+    fn a_lone_burst_is_averaged_over_the_whole_window() {
+        let mut live = LiveWindow::new();
+        live.push(1_000, &[]);
+        live.push(1_100, &[delta("curl", 6_000, 0)]);
+        let report = live.snapshot(1_101);
+        assert_eq!(report.window_secs, 60);
+        assert_eq!(report.rows[0].rx, 6_000);
     }
 
     #[test]

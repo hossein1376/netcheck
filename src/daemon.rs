@@ -1,12 +1,13 @@
-use crate::engine::{default_exclude, AppDelta, Engine, Sample};
+use crate::engine::{default_exclude, AppDelta, Buckets, Engine, Sample};
 use crate::frame::{read_magic, read_sample, FrameError};
 use crate::ifaces::local_prefixes;
 use crate::live::LiveWindow;
-use crate::procpath::image_path;
 use crate::store::Store;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static STOP: AtomicBool = AtomicBool::new(false);
+
+const FLUSH_EVERY: Duration = Duration::from_secs(30);
+const STATUS_EVERY: Duration = Duration::from_secs(10);
 
 extern "C" fn handle_stop(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
@@ -47,11 +51,12 @@ pub fn run_daemon(db: &Path) -> Result<(), String> {
         libc::signal(libc::SIGTERM, handle_stop as *const () as libc::sighandler_t);
     }
 
+    // Held until exit. A second daemon would steal the socket and double count.
+    let _lock = lock_instance(db)?;
     let store = Store::open(db).map_err(|err| err.to_string())?;
     let live = Arc::new(Mutex::new(LiveWindow::new()));
     crate::ipc::serve(db, Arc::clone(&live))?;
     let mut engine = Engine::new(default_exclude());
-    let mut paths = PathCache::default();
     let mut pending = Pending::default();
     let mut last_flush = Instant::now();
     let mut last_flush_unix = None;
@@ -66,11 +71,11 @@ pub fn run_daemon(db: &Path) -> Result<(), String> {
             &store,
             db,
             &mut engine,
-            &mut paths,
             &mut pending,
             &mut last_flush,
             &mut last_flush_unix,
             &live,
+            &mut backoff,
         ) {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -87,45 +92,61 @@ pub fn run_daemon(db: &Path) -> Result<(), String> {
     }
 }
 
-struct PathCache {
-    cache: HashMap<(u32, u64), Option<String>>,
+pub fn lock_path(db: &Path) -> PathBuf {
+    db.with_file_name("netcheck.lock")
 }
 
-impl Default for PathCache {
-    fn default() -> Self {
-        Self {
-            cache: HashMap::new(),
+fn lock_instance(db: &Path) -> Result<File, String> {
+    let path = lock_path(db);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
     }
-}
-
-impl PathCache {
-    fn resolve(&mut self, pid: u32, start: u64) -> Option<String> {
-        if self.cache.len() > 4096 {
-            self.cache.clear();
-        }
-        self.cache
-            .entry((pid, start))
-            .or_insert_with(|| image_path(pid))
-            .clone()
+    let file = File::create(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "another netcheck daemon is already using {}",
+            db.display()
+        ));
     }
+    Ok(file)
 }
 
+/// Deltas not yet written, merged per app and hour so a long database outage
+/// holds one entry per app-hour instead of one per sample.
 #[derive(Default)]
 struct Pending {
-    apps: Vec<AppDelta>,
+    apps: HashMap<(i64, String), (String, Buckets)>,
     encap: HashMap<i64, (u64, u64)>,
+}
+
+impl Pending {
+    fn add(&mut self, apps: Vec<AppDelta>) {
+        for app in apps {
+            let entry = self
+                .apps
+                .entry((app.hour, app.app_key))
+                .or_insert_with(|| (app.display_name.clone(), Buckets::default()));
+            entry.0 = app.display_name;
+            entry.1.merge(&app.buckets);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.apps.is_empty() && self.encap.is_empty()
+    }
 }
 
 fn supervise(
     store: &Store,
     db: &Path,
     engine: &mut Engine,
-    paths: &mut PathCache,
     pending: &mut Pending,
     last_flush: &mut Instant,
     last_flush_unix: &mut Option<u64>,
     live: &Mutex<LiveWindow>,
+    backoff: &mut Duration,
 ) -> Result<(), String> {
     let meter = meter_path();
     if !meter.exists() {
@@ -151,9 +172,12 @@ fn supervise(
         .take()
         .ok_or_else(|| "meter stdout is missing".to_string())?;
     read_magic(&mut stdout).map_err(|err| err.to_string())?;
+    // Source ids restart with each meter run.
+    engine.reset_flows();
 
     let mut prefixes = local_prefixes();
     let mut samples: u64 = 0;
+    let mut last_status: Option<Instant> = None;
     loop {
         if STOP.load(Ordering::SeqCst) {
             let _ = child.kill();
@@ -174,15 +198,15 @@ fn supervise(
             }
         };
         samples += 1;
+        if samples == 1 {
+            *backoff = Duration::from_secs(1);
+        }
         if samples % 60 == 1 {
             prefixes = local_prefixes();
         }
         let count = sockets.len();
         let sample = Sample { sockets };
-        let (apps, encap_rx, encap_tx) =
-            engine.ingest(&sample, SystemTime::now(), &prefixes, |pid, start| {
-                paths.resolve(pid, start)
-            });
+        let (apps, encap_rx, encap_tx) = engine.ingest(&sample, SystemTime::now(), &prefixes);
         let hour = apps.first().map(|app| app.hour).unwrap_or_else(|| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -197,11 +221,18 @@ fn supervise(
         if let Ok(mut window) = live.lock() {
             window.push(unix_now(), &apps);
         }
-        pending.apps.extend(apps);
-        write_status(db, "up", count, *last_flush_unix);
-        if last_flush.elapsed() >= Duration::from_secs(30) {
-            flush_pending(store, pending, db, Some(count), "up", last_flush_unix)?;
+        pending.add(apps);
+        if last_flush.elapsed() >= FLUSH_EVERY {
             *last_flush = Instant::now();
+            // A failed write keeps the deltas for the next try. The meter is fine.
+            if let Err(err) = flush_pending(store, pending, db, Some(count), "up", last_flush_unix) {
+                eprintln!("{err}");
+            }
+            last_status = Some(Instant::now());
+        }
+        if last_status.map_or(true, |at| at.elapsed() >= STATUS_EVERY) {
+            write_status(db, "up", count, *last_flush_unix);
+            last_status = Some(Instant::now());
         }
     }
 }
@@ -210,6 +241,7 @@ fn frame_message(err: FrameError) -> String {
     err.to_string()
 }
 
+/// Write all pending deltas in one transaction. They are kept if it fails.
 fn flush_pending(
     store: &Store,
     pending: &mut Pending,
@@ -218,20 +250,22 @@ fn flush_pending(
     meter: &str,
     last_flush_unix: &mut Option<u64>,
 ) -> Result<(), String> {
-    let mut by_hour: HashMap<i64, Vec<AppDelta>> = HashMap::new();
-    for app in pending.apps.drain(..) {
-        by_hour.entry(app.hour).or_default().push(app);
-    }
-    let encap = std::mem::take(&mut pending.encap);
-    let mut hours: Vec<i64> = by_hour.keys().copied().chain(encap.keys().copied()).collect();
-    hours.sort_unstable();
-    hours.dedup();
-    for hour in hours {
-        let apps = by_hour.remove(&hour).unwrap_or_default();
-        let (rx, tx) = encap.get(&hour).copied().unwrap_or((0, 0));
+    if !pending.is_empty() {
+        let apps: Vec<AppDelta> = pending
+            .apps
+            .iter()
+            .map(|((hour, app_key), (display_name, buckets))| AppDelta {
+                app_key: app_key.clone(),
+                display_name: display_name.clone(),
+                hour: *hour,
+                buckets: *buckets,
+            })
+            .collect();
         store
-            .flush(&apps, hour, rx, tx)
-            .map_err(|err| err.to_string())?;
+            .flush(&apps, &pending.encap)
+            .map_err(|err| format!("database write failed, will retry: {err}"))?;
+        pending.apps.clear();
+        pending.encap.clear();
     }
     let now = unix_now();
     *last_flush_unix = Some(now);
@@ -286,6 +320,18 @@ fn write_status(db: &Path, meter: &str, sockets: usize, last_flush_unix: Option<
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    #[test]
+    fn a_second_daemon_cannot_take_the_lock() {
+        let root = std::env::temp_dir().join(format!("netcheck-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let db = root.join("netcheck.db");
+        let held = lock_instance(&db).expect("first lock");
+        assert!(lock_instance(&db).is_err());
+        drop(held);
+        assert!(lock_instance(&db).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn meter_sample_names_a_process() {

@@ -61,8 +61,9 @@ pub fn write_install(home: &Path, src_bin: &Path, src_meter: &Path, db: &Path) -
 pub fn install(src_bin: &Path, src_meter: &Path, db: &Path) -> Result<(), String> {
     println!("Installs a LaunchAgent for this user. It starts at login and restarts if it exits.");
     let home = home_dir()?;
+    // Stop the old agent before its binaries are replaced.
+    let _ = bootout(&home.join(format!("Library/LaunchAgents/{LABEL}.plist")));
     let plist = write_install(&home, src_bin, src_meter, db)?;
-    let _ = bootout(&plist);
     bootstrap(&plist)?;
     kickstart()?;
     println!("loaded {}", plist.display());
@@ -89,10 +90,16 @@ fn copy_exe(src: &Path, dest: &Path) -> Result<(), String> {
     if same_file(src, dest) {
         return Ok(());
     }
-    fs::copy(src, dest).map_err(|err| format!("copy {} failed: {err}", src.display()))?;
-    let mut perms = fs::metadata(dest).map_err(|err| err.to_string())?.permissions();
+    // Copy to a new file and rename over the old one. Writing into an executable
+    // that has run leaves macOS with a stale code signature for it, and the next
+    // launch is killed.
+    let tmp = dest.with_extension("new");
+    let _ = fs::remove_file(&tmp);
+    fs::copy(src, &tmp).map_err(|err| format!("copy {} failed: {err}", src.display()))?;
+    let mut perms = fs::metadata(&tmp).map_err(|err| err.to_string())?.permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(dest, perms).map_err(|err| err.to_string())?;
+    fs::set_permissions(&tmp, perms).map_err(|err| err.to_string())?;
+    fs::rename(&tmp, dest).map_err(|err| format!("replace {} failed: {err}", dest.display()))?;
     Ok(())
 }
 
@@ -197,6 +204,15 @@ mod tests {
         assert_eq!(fs::read(bin_dir.join("netcheck")).unwrap(), b"bin");
         assert_eq!(fs::read(bin_dir.join("nstat_meter")).unwrap(), b"meter");
         assert!(body.contains(&bin_dir.join("netcheck").display().to_string()));
+
+        // A reinstall replaces the file rather than writing into it.
+        use std::os::unix::fs::MetadataExt;
+        let before = fs::metadata(bin_dir.join("netcheck")).unwrap().ino();
+        fs::write(src.join("netcheck"), b"bin2").unwrap();
+        write_install(&home, &src.join("netcheck"), &src.join("nstat_meter"), &db).unwrap();
+        let after = fs::metadata(bin_dir.join("netcheck")).unwrap();
+        assert_eq!(fs::read(bin_dir.join("netcheck")).unwrap(), b"bin2");
+        assert_ne!(after.ino(), before, "the running binary's inode must not be rewritten");
         let _ = fs::remove_dir_all(&root);
     }
 }

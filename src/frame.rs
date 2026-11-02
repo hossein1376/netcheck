@@ -2,11 +2,15 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const MAGIC: &[u8] = b"NC01";
+pub const MAGIC: &[u8] = b"NC02";
 
 /// One cumulative socket counter from a meter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketCount {
+    /// Meter-assigned id. Unique for one meter run.
+    pub source: u64,
+    /// The socket opened after the meter started, so its counters are all new usage.
+    pub new: bool,
     pub pid: u32,
     pub start_time: u64,
     pub proto: Proto,
@@ -15,6 +19,8 @@ pub struct SocketCount {
     pub remote: Option<SocketAddr>,
     pub rx: u64,
     pub tx: u64,
+    /// Executable path, read by the meter when it first saw the socket.
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,7 +44,7 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Truncated => write!(f, "truncated meter frame"),
-            FrameError::BadMagic => write!(f, "meter stream is not NC01"),
+            FrameError::BadMagic => write!(f, "meter stream is not NC02"),
             FrameError::BadType(v) => write!(f, "unknown frame type {v}"),
             FrameError::BadProto(v) => write!(f, "unknown proto {v}"),
             FrameError::BadFamily(v) => write!(f, "unknown address family {v}"),
@@ -152,31 +158,45 @@ fn read_payload(reader: &mut impl Read) -> Result<Vec<u8>, FrameError> {
 }
 
 fn parse_socket(payload: &[u8]) -> Result<SocketCount, FrameError> {
-    // type, pid, start, proto, name_len, name[64], local, remote, rx, tx
-    if payload.len() < 133 {
+    // type, source, flags, pid, start, proto, name_len, name[64], local, remote, rx, tx,
+    // path_len, path
+    if payload.len() < 144 {
         return Err(FrameError::Truncated);
     }
-    let pid = u32::from_le_bytes(payload[1..5].try_into().unwrap());
-    let start_time = u64::from_le_bytes(payload[5..13].try_into().unwrap());
-    let proto = match payload[13] {
+    let source = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+    let new = payload[9] & 1 != 0;
+    let pid = u32::from_le_bytes(payload[10..14].try_into().unwrap());
+    let start_time = u64::from_le_bytes(payload[14..22].try_into().unwrap());
+    let proto = match payload[22] {
         1 => Proto::Tcp,
         2 => Proto::Udp,
         other => return Err(FrameError::BadProto(other)),
     };
-    let name_len = payload[14] as usize;
+    let name_len = payload[23] as usize;
     if name_len > 64 {
         return Err(FrameError::Truncated);
     }
-    let name = String::from_utf8_lossy(&payload[15..15 + name_len]).into_owned();
-    let mut cursor = &payload[79..];
+    let name = String::from_utf8_lossy(&payload[24..24 + name_len]).into_owned();
+    let mut cursor = &payload[88..];
     let local = take_addr(&mut cursor)?;
     let remote = take_addr(&mut cursor)?;
-    if cursor.len() < 16 {
+    if cursor.len() < 18 {
         return Err(FrameError::Truncated);
     }
     let rx = u64::from_le_bytes(cursor[0..8].try_into().unwrap());
     let tx = u64::from_le_bytes(cursor[8..16].try_into().unwrap());
+    let path_len = u16::from_le_bytes([cursor[16], cursor[17]]) as usize;
+    let cursor = &cursor[18..];
+    if cursor.len() < path_len {
+        return Err(FrameError::Truncated);
+    }
+    let path = std::str::from_utf8(&cursor[..path_len])
+        .ok()
+        .filter(|text| text.starts_with('/'))
+        .map(str::to_owned);
     Ok(SocketCount {
+        source,
+        new,
         pid,
         start_time,
         proto,
@@ -185,6 +205,7 @@ fn parse_socket(payload: &[u8]) -> Result<SocketCount, FrameError> {
         remote,
         rx,
         tx,
+        path,
     })
 }
 
@@ -250,6 +271,8 @@ fn encode_sample(sockets: &[SocketCount]) -> Vec<u8> {
     for sock in sockets {
         let mut payload = Vec::new();
         payload.push(2);
+        payload.extend_from_slice(&sock.source.to_le_bytes());
+        payload.push(u8::from(sock.new));
         payload.extend_from_slice(&sock.pid.to_le_bytes());
         payload.extend_from_slice(&sock.start_time.to_le_bytes());
         payload.push(match sock.proto {
@@ -266,6 +289,9 @@ fn encode_sample(sockets: &[SocketCount]) -> Vec<u8> {
         put_addr(&mut payload, sock.remote);
         payload.extend_from_slice(&sock.rx.to_le_bytes());
         payload.extend_from_slice(&sock.tx.to_le_bytes());
+        let path = sock.path.as_deref().unwrap_or("").as_bytes();
+        payload.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        payload.extend_from_slice(path);
         out.extend(msg(&payload));
     }
 
@@ -281,6 +307,8 @@ mod tests {
 
     fn sock() -> SocketCount {
         SocketCount {
+            source: 3,
+            new: true,
             pid: 42,
             start_time: 1_700_000_000,
             proto: Proto::Tcp,
@@ -289,6 +317,7 @@ mod tests {
             remote: Some("1.1.1.1:443".parse().unwrap()),
             rx: 1000,
             tx: 200,
+            path: Some("/usr/bin/curl".into()),
         }
     }
 
@@ -299,6 +328,16 @@ mod tests {
         let decoded = decode_sample(&mut input).unwrap();
         assert_eq!(decoded, vec![sock()]);
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn round_trip_without_a_path() {
+        let mut quiet = sock();
+        quiet.new = false;
+        quiet.path = None;
+        let bytes = encode_sample(&[quiet.clone()]);
+        let decoded = decode_sample(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded, vec![quiet]);
     }
 
     #[test]

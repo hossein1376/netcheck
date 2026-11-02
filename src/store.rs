@@ -1,6 +1,7 @@
 use crate::engine::{AppDelta, Buckets};
 use crate::query::UsageRow;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 
 const SCHEMA: &str = r#"
@@ -50,13 +51,8 @@ impl Store {
         Ok(Self { conn })
     }
 
-    pub fn flush(
-        &self,
-        apps: &[AppDelta],
-        hour: i64,
-        encap_rx: u64,
-        encap_tx: u64,
-    ) -> rusqlite::Result<()> {
+    /// Add deltas to their hours in one transaction. `encap` maps hour to (rx, tx).
+    pub fn flush(&self, apps: &[AppDelta], encap: &HashMap<i64, (u64, u64)>) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for app in apps {
             let id: i64 = tx.query_row(
@@ -90,7 +86,10 @@ impl Store {
                 ],
             )?;
         }
-        if encap_rx > 0 || encap_tx > 0 {
+        for (hour, (encap_rx, encap_tx)) in encap {
+            if *encap_rx == 0 && *encap_tx == 0 {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO encapsulation_hour (hour_utc, rx, tx) VALUES (?1, ?2, ?3)
                  ON CONFLICT(hour_utc) DO UPDATE SET
@@ -161,9 +160,7 @@ mod tests {
                         ..Buckets::default()
                     },
                 }],
-                10,
-                7,
-                1,
+                &HashMap::from([(10, (7, 1))]),
             )
             .unwrap();
         store
@@ -177,9 +174,7 @@ mod tests {
                         ..Buckets::default()
                     },
                 }],
-                10,
-                0,
-                0,
+                &HashMap::new(),
             )
             .unwrap();
         let rows = store.usage(10, None).unwrap();

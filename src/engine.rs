@@ -17,6 +17,15 @@ pub struct Buckets {
 }
 
 impl Buckets {
+    pub(crate) fn merge(&mut self, other: &Buckets) {
+        self.internet_rx += other.internet_rx;
+        self.internet_tx += other.internet_tx;
+        self.local_rx += other.local_rx;
+        self.local_tx += other.local_tx;
+        self.unscoped_rx += other.unscoped_rx;
+        self.unscoped_tx += other.unscoped_tx;
+    }
+
     fn add(&mut self, scope: Scope, rx: u64, tx: u64) {
         match scope {
             Scope::Internet => {
@@ -65,18 +74,18 @@ impl Engine {
         }
     }
 
+    /// Forget all flows. Call when a new meter run starts, since source ids restart.
+    pub fn reset_flows(&mut self) {
+        self.diff = Diff::new();
+    }
+
     /// Fold one cumulative sample into per-app hour buckets.
-    /// `resolve` returns the executable path for a process.
-    pub fn ingest<F>(
+    pub fn ingest(
         &mut self,
         sample: &Sample,
         now: SystemTime,
         prefixes: &[Prefix],
-        mut resolve: F,
-    ) -> (Vec<AppDelta>, u64, u64)
-    where
-        F: FnMut(u32, u64) -> Option<String>,
-    {
+    ) -> (Vec<AppDelta>, u64, u64) {
         let hour = hour_index(now);
         let mut by_app: HashMap<(String, String), Buckets> = HashMap::new();
         let mut encap_rx = 0u64;
@@ -90,14 +99,7 @@ impl Engine {
             if delta.fresh || (delta.rx == 0 && delta.tx == 0) {
                 continue;
             }
-            let path = resolve(sock.pid, sock.start_time);
-            let (app_key, display) = match path {
-                Some(path) => (path.clone(), file_name(&path).to_string()),
-                None => (
-                    format!("pid:{}:{}", sock.pid, sock.start_time),
-                    sock.name.clone(),
-                ),
-            };
+            let (app_key, display) = app_identity(sock);
             if is_excluded(&self.exclude, &sock.name)
                 || is_excluded(&self.exclude, &display)
                 || is_excluded(&self.exclude, file_name(&app_key))
@@ -138,6 +140,18 @@ pub fn default_exclude() -> &'static [&'static str] {
     ]
 }
 
+/// The executable path when known. Otherwise the process name, so short-lived
+/// processes that exited before the meter saw them still group together.
+fn app_identity(sock: &SocketCount) -> (String, String) {
+    if let Some(path) = &sock.path {
+        return (path.clone(), file_name(path).to_string());
+    }
+    if sock.name.is_empty() {
+        return ("name:unknown".into(), "unknown".into());
+    }
+    (format!("name:{}", sock.name), sock.name.clone())
+}
+
 pub(crate) fn file_name(path: &str) -> &str {
     Path::new(path)
         .file_name()
@@ -169,6 +183,8 @@ mod tests {
 
     fn curl(rx: u64, remote: &str) -> SocketCount {
         SocketCount {
+            source: 1,
+            new: false,
             pid: 9,
             start_time: 5,
             proto: Proto::Tcp,
@@ -177,6 +193,7 @@ mod tests {
             remote: Some(remote.parse().unwrap()),
             rx,
             tx: 10,
+            path: Some("/usr/bin/curl".into()),
         }
     }
 
@@ -188,13 +205,11 @@ mod tests {
             &Sample { sockets: vec![curl(1_000, "1.1.1.1:443")] },
             now,
             &[],
-            |_, _| Some("/usr/bin/curl".into()),
         );
         let (apps, encap_rx, _) = engine.ingest(
             &Sample { sockets: vec![curl(6_000, "1.1.1.1:443")] },
             now,
             &[],
-            |_, _| Some("/usr/bin/curl".into()),
         );
         assert_eq!(encap_rx, 0);
         assert_eq!(apps.len(), 1);
@@ -210,18 +225,17 @@ mod tests {
         let now = at(100);
         let mut sock = curl(100, "1.1.1.1:443");
         sock.name = "mullvad-daemon".into();
+        sock.path = Some("/usr/local/bin/mullvad-daemon".into());
         engine.ingest(
             &Sample { sockets: vec![sock.clone()] },
             now,
             &[],
-            |_, _| Some("/usr/local/bin/mullvad-daemon".into()),
         );
         sock.rx = 9_100;
         let (apps, encap_rx, encap_tx) = engine.ingest(
             &Sample { sockets: vec![sock] },
             now,
             &[],
-            |_, _| Some("/usr/local/bin/mullvad-daemon".into()),
         );
         assert!(apps.is_empty());
         assert_eq!(encap_rx, 9_000);
@@ -229,17 +243,16 @@ mod tests {
     }
 
     #[test]
-    fn a_process_that_starts_after_the_daemon_counts_its_first_sample() {
+    fn a_socket_opened_after_the_meter_counts_its_first_sample() {
         let mut engine = Engine::new(default_exclude());
         let now = at(100);
         let mut born = curl(1_000_000, "1.1.1.1:443");
-        born.pid = 99;
-        born.start_time = u64::MAX;
+        born.source = 99;
+        born.new = true;
         let (apps, _, _) = engine.ingest(
             &Sample { sockets: vec![born.clone()] },
             now,
             &[],
-            |_, _| Some("/usr/bin/curl".into()),
         );
         assert_eq!(apps[0].buckets.internet_rx, 1_000_000);
         born.rx = 1_050_000;
@@ -247,9 +260,39 @@ mod tests {
             &Sample { sockets: vec![born] },
             now,
             &[],
-            |_, _| Some("/usr/bin/curl".into()),
         );
         assert_eq!(apps[0].buckets.internet_rx, 50_000);
+    }
+
+    #[test]
+    fn an_unresolved_process_groups_by_name() {
+        let mut engine = Engine::new(default_exclude());
+        let now = at(100);
+        let mut socks = Vec::new();
+        for (source, pid) in [(1, 500), (2, 501)] {
+            let mut sock = curl(2_000, "1.1.1.1:443");
+            sock.source = source;
+            sock.pid = pid;
+            sock.new = true;
+            sock.path = None;
+            socks.push(sock);
+        }
+        let (apps, _, _) = engine.ingest(&Sample { sockets: socks }, now, &[]);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].app_key, "name:curl");
+        assert_eq!(apps[0].display_name, "curl");
+        assert_eq!(apps[0].buckets.internet_rx, 4_000);
+    }
+
+    #[test]
+    fn reset_flows_baselines_the_next_run() {
+        let mut engine = Engine::new(default_exclude());
+        let now = at(100);
+        engine.ingest(&Sample { sockets: vec![curl(1_000, "1.1.1.1:443")] }, now, &[]);
+        engine.reset_flows();
+        let (apps, _, _) =
+            engine.ingest(&Sample { sockets: vec![curl(9_000, "1.1.1.1:443")] }, now, &[]);
+        assert!(apps.is_empty(), "a reused source id must not bill across runs");
     }
 
     #[test]
@@ -260,7 +303,6 @@ mod tests {
             &Sample { sockets: vec![curl(10, "192.168.1.20:80")] },
             now,
             &[],
-            |_, _| Some("/usr/bin/curl".into()),
         );
         let mut sock = curl(410, "192.168.1.20:80");
         sock.tx = 10;
@@ -268,7 +310,6 @@ mod tests {
             &Sample { sockets: vec![sock] },
             now,
             &[],
-            |_, _| Some("/usr/bin/curl".into()),
         );
         assert_eq!(apps[0].buckets.local_rx, 400);
         assert_eq!(apps[0].buckets.internet_rx, 0);
