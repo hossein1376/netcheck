@@ -21,7 +21,20 @@ netcheck records how much each app sends and receives, split into internet, loca
 
 **Lowest overhead is the deciding criterion.** When designs compete, the one with less CPU, fewer wakeups and less memory wins, even if it adds a language such as C.
 
-**Overhead budget (macOS today):** about 4 MB for the daemon and 7 MB for the meter, idle CPU near 0%, one SQLite transaction every 30 s, and one status-file write every 10 s. Each meter is measured the same way: CPU seconds per hour and wakeups per second, idle and during a saturating transfer.
+**Measured overhead (macOS, 2026-11-01):** measured with `scripts/overhead.py`, before and after the 10 s cadence and changed-only snapshots.
+
+| Scenario | Process | CPU s/hour before → after | Wakeups/s before → after | Memory after |
+| --- | --- | --- | --- | --- |
+| Idle, 120 s | meter | 9.2 → 1.0 | 0.98 → 0.19 | 2.3 MB |
+| Idle, 120 s | daemon | 1.1 → 0.4 | 0 → 0 | 2.0 MB |
+| Full-speed loopback stream, 60 s | meter | 8.1 → 1.8 | 0.98 → 0.13 | 2.4 MB |
+| Full-speed loopback stream, 60 s | daemon | 1.0 → 0.3 | 0 → 0 | 2.2 MB |
+| About 130 short connections/s, 60 s | meter | 168 → 178 | 0.95 → 0.10 | 10.7 MB |
+| About 130 short connections/s, 60 s | daemon | 3.6 → 2.1 | 0 → 0 | 3.3 MB |
+
+Memory is physical footprint. Wakeups are interrupt wakeups; package-idle wakeups stayed under 0.1/s throughout. While `top` keeps the meter at live cadence, it runs at about 1 wakeup/s and 12 CPU s/hour. Daemon disk writes are 12–18 KB/min: the status file every 10 s plus one SQLite transaction every 30 s.
+
+Under connection churn the meter costs about 0.37 ms of CPU per new connection, roughly half user and half kernel time. The cadence and snapshot changes didn't touch that path. Profiling puts most of it outside netcheck's code, in NetworkStatistics' per-socket event handling.
 
 ## Current state: macOS v1
 
@@ -75,12 +88,13 @@ The daemon diffs each snapshot, classifies and attributes the bytes, then sends 
 
 ## Meter contract
 
-Every meter delivers, about once a second, a full snapshot of live sockets as `SocketCount` records with cumulative counters. That contract is what makes the core platform-independent. The NC02 byte frame is only how the macOS meter sends it.
+Every meter delivers snapshots of `SocketCount` records with cumulative counters: every 10 s, or every second while someone is watching. Each snapshot holds only sockets that changed. That contract is what makes the core platform-independent, and it's written down as the `Meter` trait in `src/meter/mod.rs`. The NC02 byte frame is only how the macOS meter sends it.
 
 | Field | Meaning | Rule |
 | --- | --- | --- |
 | `source` | Meter-assigned socket id | Unique for one meter run; never reused in that run |
 | `new` | No bytes in these counters predate the meter | True for sockets opened after the first snapshot; false for sockets that already existed |
+| `closed` | This is the socket's last report | Set once, with the final counters |
 | `rx`, `tx` | Bytes received and sent | Cumulative from the later of socket open or meter start; never decrease |
 | `pid`, `start_time` | Owning process and its start time (Unix s) | Captured when the meter first sees the socket |
 | `path` | Executable path | Captured on first sight; absent if the process was already gone |
@@ -90,13 +104,15 @@ Every meter delivers, about once a second, a full snapshot of live sockets as `S
 
 **Lifecycle rules**
 
-1. A closed socket appears in exactly one more snapshot with its final counters, then disappears.
-2. Snapshots are complete: a live socket missing from a snapshot is treated as gone.
-3. A meter restart starts a new run: ids restart, and the daemon resets its flow state (`Engine::reset_flows`).
+1. A snapshot holds every socket on its first report, then only sockets whose counters changed. A socket missing from a snapshot is unchanged.
+2. A closed socket is reported once more with `closed` set and its final counters, then never again. The daemon forgets a flow only then.
+3. **Cadence:** the first snapshot comes about 1 s after the start, then every 10 s. For 60 s after any `top` request, the daemon switches the meter to every second. A slower cadence loses no bytes, because closed sockets wait for the next snapshot.
+4. **Stopping:** before stopping, the daemon asks for one last snapshot (`snapshot_now`), so the final interval is kept. The macOS meter also takes a final snapshot itself on `SIGINT` or `SIGTERM`, which covers Ctrl-C in a terminal.
+5. A meter restart starts a new run: ids restart, and the daemon resets its flow state (`Engine::reset_flows`).
 
 **How the daemon turns this into usage:** first sight of a `new` socket bills its full counters; first sight of an old socket records a baseline; every later sight bills the increase. Event-based meters (Linux eBPF, Windows ETW) satisfy the contract by summing deltas per socket from attach time and marking every socket `new`.
 
-**NC02 frame (macOS):** a `NC02` magic header, then length-prefixed messages: snapshot start, one socket record per socket (142 fixed bytes plus a path of up to 4,096 bytes), and snapshot end with a count. Little-endian throughout.
+**NC02 frame (macOS):** a `NC02` magic header, then length-prefixed messages: snapshot start (a flag marks a requested snapshot), one socket record per reported socket (142 fixed bytes plus a path of up to 4,096 bytes; flag bits for `new` and `closed`), and snapshot end with a count. Little-endian throughout. The daemon controls the meter with one-byte commands on its stdin: `l` live cadence, `i` idle cadence, `n` snapshot now. When stdin closes, the meter exits.
 
 ## Data model and storage
 
@@ -176,6 +192,8 @@ These are settled unless new evidence reopens them. Newest first.
 
 | When | Decision | Why | Rejected |
 | --- | --- | --- | --- |
+| Built 2026-11-01 | Snapshot every 10 s, or every second for 60 s after a `top` request; one final snapshot on stop | The meter's 1 s timer was its main idle cost, and closed sockets wait for the next snapshot, so a slower cadence loses nothing | A fixed 1 s interval |
+| Built 2026-11-01 | Snapshots hold only changed sockets, plus one `closed` report per socket | Most sockets are idle in any interval; re-sending them cost meter and daemon work every snapshot | Complete snapshots |
 | Decided 2026-11-01 | Lowest runtime overhead decides between designs; other languages (C or others) are allowed where they lower it | A native, low-overhead daemon is the product goal | A single-language codebase as a constraint |
 | Decided 2026-11-01 | No CI for now; the conformance suite runs locally | Not worth the setup at this stage | A GitHub Actions matrix |
 | Decided 2026-11-01, not built | Linux and Windows run as a system service with a system-wide database readable by a `netcheck` group; IPC checks peer credentials. macOS stays a per-user LaunchAgent | eBPF and ETW need root or admin; a group keeps reads off root without a second process | Privileged meter feeding a per-user daemon; root-only reads |
@@ -196,7 +214,7 @@ These are settled unless new evidence reopens them. Newest first.
 
 ## Open decisions
 
-Decisions 5–8 shape the meters, so settle them before the first port. Decision 2 should be settled before the GUI starts, since it shapes the IPC API. The recommendations are proposals, not decisions.
+Decisions 5 and 6 shape the meters, so settle them before each port. Decision 2 should be settled before the GUI starts, since it shapes the IPC API. The recommendations are proposals, not decisions.
 
 | # | Decision | Options | Recommendation | Blocks |
 | --- | --- | --- | --- | --- |
@@ -206,12 +224,10 @@ Decisions 5–8 shape the meters, so settle them before the first port. Decision
 | 4 | Retention | Keep forever; roll up to daily totals after N days | Defer; revisit when the database passes about 50 MB | Nothing yet |
 | 5 | Linux probe language and hooks | C loaded with `libbpf-rs`; Rust with Aya (needs nightly and `bpf-linker`). Hooks: `fentry`, `kprobe`, or per-packet `cgroup_skb` | C with `libbpf-rs`; `fentry` on `tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp_sendmsg`, `udp_recvmsg`; per-socket counters in a BPF hash map keyed by socket cookie, read in one batch per interval; closed entries deleted only after they're read | Linux meter |
 | 6 | Windows ETW consumer | `ferrisetw` (decodes each event by schema lookup, TDH); the raw `windows` crate with fixed layouts parsed by hand. Source: the `Microsoft-Windows-Kernel-Network` provider or the classic kernel logger's TCP/IP flag | Raw `windows` crate, hand-parsed, TCP and UDP events only; choose the source by measuring both | Windows meter |
-| 7 | Snapshot interval | Fixed 1 s; adaptive | 10 s by default, 1 s while `top` or the GUI is connected. Closed sockets already wait for the next snapshot, so no bytes are lost | Meter contract, IPC |
-| 8 | Snapshot content | Complete snapshots (today); changed sockets plus explicit close records | Changed sockets plus close records; drops lifecycle rule 2 | Meter contract, every meter |
 
 ## Testing and verification
 
-The core has 36 unit tests with synthetic samples. Every meter must also pass the conformance suite in `tests/conformance.rs`: real loopback traffic through a real daemon, checked to the byte. It's ignored by default because it takes about 6 s and needs the OS meter:
+The core has 36 unit tests with synthetic samples. Every meter must also pass the conformance suite in `tests/conformance.rs`: real loopback traffic through a real daemon, checked to the byte. It's ignored by default because it takes about 13 s and needs the OS meter:
 
 ```bash
 cargo test --release --test conformance -- --ignored --test-threads=1
@@ -231,7 +247,13 @@ Cases 1–6 are automated and passed 10 runs in a row on macOS on 2026-11-01. Ca
 
 **CI:** deferred. The unit tests and each OS's conformance suite run locally. GitHub Actions runners can run eBPF (Ubuntu with `sudo`) and ETW (Windows as administrator) when CI is added.
 
-**Overhead measurement:** CPU seconds per hour and wakeups per second for the daemon and meter, idle and during a saturating transfer. On macOS, `powermetrics` reports wakeups. On Linux, `bpftool prog show` reports probe time in the kernel once `kernel.bpf_stats_enabled` is on.
+**Overhead measurement:** CPU seconds per hour, wakeups per second, disk writes and memory for the daemon and meter. Three scenarios: idle, a full-speed loopback stream, and connection churn. On macOS, `scripts/overhead.py` reads each process's counters with `proc_pid_rusage`, which needs no root, and measures the installed agent:
+
+```bash
+python3 -I scripts/overhead.py --idle 120 --load 60 --rate 200
+```
+
+The churn generator reports the rate it achieved, because loopback connects occasionally stall at high rates. Compare churn runs per connection, not per hour. On Linux, `bpftool prog show` reports probe time in the kernel once `kernel.bpf_stats_enabled` is on.
 
 ## Known limitations and risks
 
@@ -247,3 +269,5 @@ The largest risk is that macOS depends on a private framework. The rest are boun
 | Attribution gaps (helpers, delegated traffic, interpreters, CGNAT) | Usage credited to the wrong row, or counted twice for Tailscale | App grouping (built for macOS bundles); open decisions 1 and 3 |
 | eBPF and ETW need root or admin | A different install and trust model from macOS | Decided: system service with a `netcheck` group |
 | ETW event loss under load | Undercount on busy Windows machines | Report lost events in `status` |
+| Meter cost grows with connection churn | About 0.37 ms CPU per new connection on macOS, roughly 5% of a core at 130 connections/s | Not yet addressed. Leads: skip the path syscalls when the UUID cache already knows the binary; check whether NetworkStatistics filters can drop loopback sockets in the kernel (that would stop counting loopback traffic) |
+| Stopping can take up to one idle interval | The daemon notices a stop only when the next snapshot arrives, up to 10 s; launchd allows 20 s | Acceptable for now. That snapshot already holds the last interval, so nothing is lost |

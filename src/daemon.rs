@@ -1,16 +1,20 @@
 use crate::engine::{default_exclude, AppDelta, Engine, Sample};
 use crate::live::LiveWindow;
-use crate::meter::{self, Meter};
+use crate::meter::{self, Cadence, Meter, SocketCount};
+use crate::classify::Prefix;
 use crate::platform::{self, local_prefixes, stop_requested};
 use crate::store::Store;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FLUSH_EVERY: Duration = Duration::from_secs(30);
 const STATUS_EVERY: Duration = Duration::from_secs(10);
+/// How long the meter stays at live cadence after a `top` request.
+const LIVE_FOR: u64 = 60;
 
 pub fn default_db_path() -> PathBuf {
     platform::data_dir().join("netcheck.db")
@@ -31,11 +35,13 @@ pub fn run_daemon(db: &Path) -> Result<(), String> {
         .map_err(|err| format!("{err} for {}", db.display()))?;
     let store = Store::open(db).map_err(|err| err.to_string())?;
     let live = Arc::new(Mutex::new(LiveWindow::new()));
-    crate::ipc::serve(db, Arc::clone(&live))?;
+    let watched = Arc::new(AtomicU64::new(0));
+    crate::ipc::serve(db, Arc::clone(&live), Arc::clone(&watched))?;
     let mut daemon = Daemon {
         store,
         db,
         live,
+        watched,
         engine: Engine::new(default_exclude()),
         pending: Pending::default(),
         last_flush: Instant::now(),
@@ -69,6 +75,8 @@ struct Daemon<'a> {
     store: Store,
     db: &'a Path,
     live: Arc<Mutex<LiveWindow>>,
+    /// Unix time of the last live-data request.
+    watched: Arc<AtomicU64>,
     engine: Engine,
     pending: Pending,
     last_flush: Instant,
@@ -85,10 +93,24 @@ impl Daemon<'_> {
         let mut prefixes = local_prefixes();
         let mut samples: u64 = 0;
         let mut last_status: Option<Instant> = None;
+        let mut cadence = Cadence::Idle;
         loop {
             if stop_requested() {
+                // Collect the last interval before the meter goes away.
+                if let Ok(sockets) = meter.snapshot_now() {
+                    self.ingest(sockets, &prefixes);
+                }
                 drop(meter);
                 return self.flush("down", None);
+            }
+            let wanted = if unix_now().saturating_sub(self.watched.load(Ordering::Relaxed)) < LIVE_FOR {
+                Cadence::Live
+            } else {
+                Cadence::Idle
+            };
+            if wanted != cadence {
+                meter.set_cadence(wanted)?;
+                cadence = wanted;
             }
             let sockets = match meter.next_sample() {
                 Ok(sockets) => sockets,
@@ -107,19 +129,7 @@ impl Daemon<'_> {
             if samples % 60 == 1 {
                 prefixes = local_prefixes();
             }
-            let count = sockets.len();
-            let now = SystemTime::now();
-            let (apps, encap_rx, encap_tx) =
-                self.engine.ingest(&Sample { sockets }, now, &prefixes);
-            if encap_rx > 0 || encap_tx > 0 {
-                let entry = self.pending.encap.entry(crate::engine::hour_index(now)).or_insert((0, 0));
-                entry.0 += encap_rx;
-                entry.1 += encap_tx;
-            }
-            if let Ok(mut window) = self.live.lock() {
-                window.push(unix_now(), &apps);
-            }
-            self.pending.add(apps);
+            let count = self.ingest(sockets, &prefixes);
             if self.last_flush.elapsed() >= FLUSH_EVERY {
                 self.last_flush = Instant::now();
                 // A failed write keeps the deltas for the next try. The meter is fine.
@@ -133,6 +143,24 @@ impl Daemon<'_> {
                 last_status = Some(Instant::now());
             }
         }
+    }
+
+    /// Fold one snapshot into pending deltas and the live window. Returns the
+    /// number of sockets it reported.
+    fn ingest(&mut self, sockets: Vec<SocketCount>, prefixes: &[Prefix]) -> usize {
+        let count = sockets.len();
+        let now = SystemTime::now();
+        let (apps, encap_rx, encap_tx) = self.engine.ingest(&Sample { sockets }, now, prefixes);
+        if encap_rx > 0 || encap_tx > 0 {
+            let entry = self.pending.encap.entry(crate::engine::hour_index(now)).or_insert((0, 0));
+            entry.0 += encap_rx;
+            entry.1 += encap_tx;
+        }
+        if let Ok(mut window) = self.live.lock() {
+            window.push(unix_now(), &apps);
+        }
+        self.pending.add(apps);
+        count
     }
 
     /// Write all pending deltas in one transaction. They are kept if it fails.

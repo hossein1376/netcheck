@@ -17,6 +17,8 @@ pub struct SocketCount {
     pub source: u64,
     /// The socket opened after the meter started, so its counters are all new usage.
     pub new: bool,
+    /// The socket is closed. This is its last report.
+    pub closed: bool,
     pub pid: u32,
     pub start_time: u64,
     pub proto: Proto,
@@ -35,22 +37,42 @@ pub enum Proto {
     Udp,
 }
 
+/// How often a meter takes snapshots. A closed socket waits for the next
+/// snapshot either way, so a slower cadence loses no bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cadence {
+    /// Nobody is watching: every 10 s.
+    Idle,
+    /// A live view is open: every second.
+    Live,
+}
+
 /// A source of socket snapshots for one meter run.
 ///
 /// Rules every meter keeps:
-/// - `next_sample` blocks until the next snapshot, about once a second, and
-///   returns every live socket.
+/// - A snapshot holds every socket on its first report, then only sockets
+///   whose counters changed. A socket missing from a snapshot is unchanged.
+/// - A closed socket is reported once more with `closed` set and its final
+///   counters, then never again.
 /// - `source` ids are unique for the life of the meter and never reused.
 /// - Counters are cumulative from the later of socket open or meter start, and
 ///   never decrease. `new` is true when no counted byte predates the meter.
-/// - A closed socket appears in one more snapshot with its final counters.
+/// - The first snapshot comes within about a second of the start, at
+///   [`Cadence::Idle`] after that.
 ///
 /// Dropping the meter ends the run. A new meter starts a new run with new ids.
 pub trait Meter {
     /// Short name of the OS source, shown in `netcheck status`.
     fn backend(&self) -> &'static str;
 
+    /// Block until the next snapshot.
     fn next_sample(&mut self) -> Result<Vec<SocketCount>, String>;
+
+    fn set_cadence(&mut self, cadence: Cadence) -> Result<(), String>;
+
+    /// Take a snapshot now and return everything reported up to it. Used
+    /// when a stop is noticed between snapshots, so the last interval is kept.
+    fn snapshot_now(&mut self) -> Result<Vec<SocketCount>, String>;
 }
 
 /// Start this OS's meter.

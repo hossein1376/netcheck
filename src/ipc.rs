@@ -3,6 +3,9 @@
 
 use crate::live::{LiveWindow, TopReport};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -18,7 +21,7 @@ pub fn socket_path(db: &Path) -> PathBuf {
 }
 
 #[cfg(not(unix))]
-pub fn serve(_db: &Path, _live: Arc<Mutex<LiveWindow>>) -> Result<(), String> {
+pub fn serve(_db: &Path, _live: Arc<Mutex<LiveWindow>>, _watched: Arc<AtomicU64>) -> Result<(), String> {
     Ok(())
 }
 
@@ -27,8 +30,10 @@ pub fn fetch_top(_db: &Path) -> Result<TopReport, String> {
     Err("top is not supported on this OS yet".into())
 }
 
+/// Serve `top`. Each request stamps `watched`, which keeps the meter at live
+/// cadence for a while.
 #[cfg(unix)]
-pub fn serve(db: &Path, live: Arc<Mutex<LiveWindow>>) -> Result<(), String> {
+pub fn serve(db: &Path, live: Arc<Mutex<LiveWindow>>, watched: Arc<AtomicU64>) -> Result<(), String> {
     let path = socket_path(db);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -45,7 +50,8 @@ pub fn serve(db: &Path, live: Arc<Mutex<LiveWindow>>) -> Result<(), String> {
         for conn in listener.incoming() {
             let Ok(stream) = conn else { continue };
             let live = Arc::clone(&live);
-            std::thread::spawn(move || handle(stream, &live));
+            let watched = Arc::clone(&watched);
+            std::thread::spawn(move || handle(stream, &live, &watched));
         }
     });
     Ok(())
@@ -72,7 +78,7 @@ pub fn fetch_top(db: &Path) -> Result<TopReport, String> {
 }
 
 #[cfg(unix)]
-fn handle(mut stream: UnixStream, live: &Mutex<LiveWindow>) {
+fn handle(mut stream: UnixStream, live: &Mutex<LiveWindow>, watched: &AtomicU64) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = [0u8; 32];
     let Ok(n) = stream.read(&mut buf) else { return };
@@ -84,6 +90,7 @@ fn handle(mut stream: UnixStream, live: &Mutex<LiveWindow>) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    watched.store(now, Ordering::Relaxed);
     let Ok(mut window) = live.lock() else { return };
     let report = window.snapshot(now);
     drop(window);
@@ -125,8 +132,10 @@ mod tests {
                 },
             }],
         );
-        serve(&db, Arc::clone(&live)).unwrap();
+        let watched = Arc::new(AtomicU64::new(0));
+        serve(&db, Arc::clone(&live), Arc::clone(&watched)).unwrap();
         let report = fetch_top(&db).expect("top");
+        assert!(watched.load(Ordering::Relaxed) >= now, "a top request marks the daemon as watched");
         assert_eq!(report.rows[0].name, "curl");
         assert_eq!(report.rows[0].rx, 40);
         let _ = std::fs::remove_dir_all(&root);

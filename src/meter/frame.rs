@@ -52,15 +52,27 @@ pub fn read_magic(reader: &mut impl Read) -> Result<(), FrameError> {
     Ok(())
 }
 
-pub fn read_sample(reader: &mut impl Read) -> Result<Vec<SocketCount>, FrameError> {
-    let mut sockets = Vec::new();
+/// One snapshot as framed by the meter.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub sockets: Vec<SocketCount>,
+    /// Taken on request (`n` on stdin or a stop signal), not by the timer.
+    pub requested: bool,
+}
+
+pub fn read_snapshot(reader: &mut impl Read) -> Result<Snapshot, FrameError> {
+    let mut snapshot = Snapshot::default();
     loop {
         let payload = read_payload(reader)?;
-        match consume_payload(&payload, &mut sockets)? {
+        match consume_payload(&payload, &mut snapshot)? {
             Step::Continue => {}
-            Step::Done => return Ok(sockets),
+            Step::Done => return Ok(snapshot),
         }
     }
+}
+
+pub fn read_sample(reader: &mut impl Read) -> Result<Vec<SocketCount>, FrameError> {
+    read_snapshot(reader).map(|snapshot| snapshot.sockets)
 }
 
 enum Step {
@@ -69,24 +81,27 @@ enum Step {
 }
 
 fn decode_one(input: &mut &[u8]) -> Result<Vec<SocketCount>, FrameError> {
-    let mut sockets = Vec::new();
+    let mut snapshot = Snapshot::default();
     loop {
         let payload = pull_msg(input)?;
-        match consume_payload(payload, &mut sockets)? {
+        match consume_payload(payload, &mut snapshot)? {
             Step::Continue => {}
-            Step::Done => return Ok(sockets),
+            Step::Done => return Ok(snapshot.sockets),
         }
     }
 }
 
-fn consume_payload(payload: &[u8], sockets: &mut Vec<SocketCount>) -> Result<Step, FrameError> {
+fn consume_payload(payload: &[u8], snapshot: &mut Snapshot) -> Result<Step, FrameError> {
     if payload.is_empty() {
         return Err(FrameError::Truncated);
     }
     match payload[0] {
-        1 => Ok(Step::Continue),
+        1 => {
+            snapshot.requested = payload.get(1).is_some_and(|flags| flags & 1 != 0);
+            Ok(Step::Continue)
+        }
         2 => {
-            sockets.push(parse_socket(payload)?);
+            snapshot.sockets.push(parse_socket(payload)?);
             Ok(Step::Continue)
         }
         3 => Ok(Step::Done),
@@ -135,6 +150,7 @@ fn parse_socket(payload: &[u8]) -> Result<SocketCount, FrameError> {
     }
     let source = u64::from_le_bytes(payload[1..9].try_into().unwrap());
     let new = payload[9] & 1 != 0;
+    let closed = payload[9] & 2 != 0;
     let pid = u32::from_le_bytes(payload[10..14].try_into().unwrap());
     let start_time = u64::from_le_bytes(payload[14..22].try_into().unwrap());
     let proto = match payload[22] {
@@ -167,6 +183,7 @@ fn parse_socket(payload: &[u8]) -> Result<SocketCount, FrameError> {
     Ok(SocketCount {
         source,
         new,
+        closed,
         pid,
         start_time,
         proto,
@@ -242,7 +259,7 @@ fn encode_sample(sockets: &[SocketCount]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(2);
         payload.extend_from_slice(&sock.source.to_le_bytes());
-        payload.push(u8::from(sock.new));
+        payload.push(u8::from(sock.new) | u8::from(sock.closed) << 1);
         payload.extend_from_slice(&sock.pid.to_le_bytes());
         payload.extend_from_slice(&sock.start_time.to_le_bytes());
         payload.push(match sock.proto {
@@ -279,6 +296,7 @@ mod tests {
         SocketCount {
             source: 3,
             new: true,
+            closed: false,
             pid: 42,
             start_time: 1_700_000_000,
             proto: Proto::Tcp,
@@ -304,6 +322,7 @@ mod tests {
     fn round_trip_without_a_path() {
         let mut quiet = sock();
         quiet.new = false;
+        quiet.closed = true;
         quiet.path = None;
         let bytes = encode_sample(&[quiet.clone()]);
         let decoded = decode_sample(&mut bytes.as_slice()).unwrap();

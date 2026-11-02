@@ -103,12 +103,11 @@ impl Engine {
         let mut by_app: HashMap<(String, String), Buckets> = HashMap::new();
         let mut encap_rx = 0u64;
         let mut encap_tx = 0u64;
-        let mut seen = HashSet::new();
-
         for sock in &sample.sockets {
-            let key = Diff::key_of(sock);
             let delta = self.diff.observe(sock);
-            seen.insert(key);
+            if sock.closed {
+                self.diff.forget(&Diff::key_of(sock));
+            }
             if delta.fresh || (delta.rx == 0 && delta.tx == 0) {
                 continue;
             }
@@ -127,7 +126,6 @@ impl Engine {
                 .or_default()
                 .add(scope, delta.rx, delta.tx);
         }
-        self.diff.finish_sample(&seen);
 
         let apps = by_app
             .into_iter()
@@ -202,6 +200,7 @@ mod tests {
         SocketCount {
             source: 1,
             new: false,
+            closed: false,
             pid: 9,
             start_time: 5,
             proto: Proto::Tcp,

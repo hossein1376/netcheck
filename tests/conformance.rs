@@ -74,8 +74,8 @@ fn meter_counts_loopback_traffic_exactly() {
     let said = String::from_utf8_lossy(&second.stderr);
     assert!(said.contains("already running"), "second daemon said: {said}");
 
-    // Let closed sockets reach a snapshot, then stop and flush.
-    thread::sleep(Duration::from_secs(3));
+    // Stop at idle cadence: the daemon must take a final snapshot so the
+    // last interval is not lost.
     stop(&mut daemon);
 
     let store = Store::open_read(&db).unwrap();
@@ -146,7 +146,8 @@ fn wait_for_first_sample(db: &Path, daemon: &mut Child) {
 
 fn stop(daemon: &mut Child) {
     unsafe { libc::kill(daemon.id() as i32, libc::SIGINT) };
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // The daemon notices at its next snapshot, up to one idle interval.
+    let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline {
         if let Some(code) = daemon.try_wait().unwrap() {
             assert!(code.success(), "daemon exited with {code}");

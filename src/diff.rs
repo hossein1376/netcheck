@@ -1,5 +1,5 @@
 use crate::meter::SocketCount;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A meter source. Ids are unique within one meter run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,9 +70,9 @@ impl Diff {
         delta
     }
 
-    /// Drop flows that were not in this sample. They emit nothing.
-    pub fn finish_sample(&mut self, seen: &HashSet<FlowKey>) {
-        self.prev.retain(|key, _| seen.contains(key));
+    /// Forget a closed flow after its final report.
+    pub fn forget(&mut self, key: &FlowKey) {
+        self.prev.remove(key);
     }
 }
 
@@ -85,6 +85,7 @@ mod tests {
         SocketCount {
             source: 1,
             new: false,
+            closed: false,
             pid: 7,
             start_time: 10,
             proto: Proto::Tcp,
@@ -142,14 +143,21 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_that_vanishes_emits_nothing() {
+    fn a_flow_missing_from_snapshots_keeps_its_baseline() {
+        let mut diff = Diff::new();
+        diff.observe(&sock(10, 10));
+        // Unchanged for a few snapshots, so not reported, then it moves.
+        let later = diff.observe(&sock(80, 10));
+        assert_eq!(later, Delta { rx: 70, tx: 0, fresh: false });
+    }
+
+    #[test]
+    fn a_forgotten_flow_starts_over() {
         let mut diff = Diff::new();
         let first = sock(10, 10);
         diff.observe(&first);
-        diff.finish_sample(&HashSet::from([Diff::key_of(&first)]));
-        diff.finish_sample(&HashSet::new());
+        diff.forget(&Diff::key_of(&first));
         let again = diff.observe(&sock(80, 80));
-        assert!(again.fresh, "a vanished flow must not bill its old life");
-        assert_eq!(again.rx, 0);
+        assert!(again.fresh, "a forgotten flow must not bill its old life");
     }
 }
