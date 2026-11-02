@@ -13,12 +13,12 @@ pub use unix::{local_prefixes, on_stop_signal};
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{data_dir, install, uninstall};
+pub use macos::{data_dir, install, uninstall, READER_GROUP};
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{data_dir, install, uninstall};
+pub use linux::{data_dir, install, uninstall, READER_GROUP};
 
 #[cfg(windows)]
 mod windows;
@@ -26,6 +26,15 @@ mod windows;
 pub use windows::{data_dir, install, local_prefixes, on_stop_signal, uninstall};
 
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Let the reader group, and only it, see the daemon's data directory and
+/// connect to its socket. Only takes effect when the daemon runs as root.
+pub fn share_with_readers(path: &Path) {
+    #[cfg(unix)]
+    unix::share_with_group(path, READER_GROUP);
+    #[cfg(not(unix))]
+    let _ = path;
+}
 
 /// True once the OS asked the daemon to stop.
 pub fn stop_requested() -> bool {

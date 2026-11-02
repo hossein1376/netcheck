@@ -2,6 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+/// Group allowed to read usage data. Install will create it.
+pub const READER_GROUP: &str = "netcheck";
+
 pub fn data_dir() -> PathBuf {
     PathBuf::from("/var/lib/netcheck")
 }

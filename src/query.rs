@@ -1,3 +1,4 @@
+use crate::meter::Links;
 use serde::Serialize;
 use std::time::{Duration, SystemTime};
 
@@ -12,6 +13,18 @@ pub struct UsageRow {
     pub local_tx: u64,
     pub unscoped_rx: u64,
     pub unscoped_tx: u64,
+    /// The same bytes across all scopes, split by link kind.
+    #[serde(flatten)]
+    pub links: Links,
+}
+
+/// VPN tunnel bytes over a window, kept out of app totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TunnelRow {
+    pub rx: u64,
+    pub tx: u64,
+    #[serde(flatten)]
+    pub links: Links,
 }
 
 impl UsageRow {

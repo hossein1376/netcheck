@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use netcheck::{
-    default_db_path, fetch_top, min_hour, parse_since, platform, run_daemon, status_path, By, Store,
-    UsageRow,
+    default_db_path, fetch_top, min_hour, parse_since, platform, run_daemon, status_path, By, Links,
+    Store, TunnelRow, UsageRow,
 };
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -31,6 +31,9 @@ enum Cmd {
         /// One row per executable instead of per app.
         #[arg(long)]
         by_exe: bool,
+        /// Split totals by link: Wi-Fi, wired, cellular, other.
+        #[arg(long)]
+        links: bool,
         #[arg(long)]
         json: bool,
     },
@@ -64,11 +67,12 @@ fn main() {
             since,
             app,
             by_exe,
+            links,
             json,
         } => {
             let db = db.unwrap_or_else(default_db_path);
             let by = if by_exe { By::Executable } else { By::App };
-            show_usage(&db, &since, app.as_deref(), by, json)
+            show_usage(&db, &since, app.as_deref(), by, links, json)
         }
         Cmd::Status { db } => {
             let db = db.unwrap_or_else(default_db_path);
@@ -95,6 +99,7 @@ fn show_usage(
     since: &str,
     app: Option<&str>,
     by: By,
+    links: bool,
     json: bool,
 ) -> Result<(), String> {
     let start = parse_since(since, SystemTime::now())?;
@@ -102,19 +107,25 @@ fn show_usage(
     let rows = store
         .usage(min_hour(start), app, by)
         .map_err(|err| err.to_string())?;
+    let tunnel = store.tunnel(min_hour(start)).map_err(|err| err.to_string())?;
     if json {
-        let body: Vec<UsageJson> = rows
+        let apps: Vec<UsageJson> = rows
             .iter()
             .map(|row| UsageJson {
                 off_machine: row.off_machine(),
                 row,
             })
             .collect();
+        let body = serde_json::json!({ "apps": apps, "vpn_tunnel": tunnel });
         println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
         return Ok(());
     }
     if rows.is_empty() {
         println!("No usage in that window yet.");
+        return Ok(());
+    }
+    if links {
+        show_links(&rows, &tunnel);
         return Ok(());
     }
     println!(
@@ -135,6 +146,39 @@ fn show_usage(
     }
     println!("Off-machine is internet plus unscoped. Hours overlap the window.");
     Ok(())
+}
+
+fn show_links(rows: &[UsageRow], tunnel: &TunnelRow) {
+    println!(
+        "{:<24} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "APP", "DOWN", "UP", "WI-FI", "WIRED", "CELLULAR", "OTHER"
+    );
+    let line = |name: &str, rx: u64, tx: u64, l: &Links| {
+        let wifi = l.wifi_rx + l.wifi_tx;
+        let wired = l.wired_rx + l.wired_tx;
+        let cellular = l.cellular_rx + l.cellular_tx;
+        let other = (rx + tx).saturating_sub(wifi + wired + cellular);
+        println!(
+            "{:<24} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            clip(name, 24),
+            fmt_bytes(rx),
+            fmt_bytes(tx),
+            fmt_bytes(wifi),
+            fmt_bytes(wired),
+            fmt_bytes(cellular),
+            fmt_bytes(other),
+        );
+    };
+    for row in rows {
+        let rx = row.internet_rx + row.local_rx + row.unscoped_rx;
+        let tx = row.internet_tx + row.local_tx + row.unscoped_tx;
+        line(&row.name, rx, tx, &row.links);
+    }
+    if tunnel.rx + tunnel.tx > 0 {
+        line("(VPN tunnel)", tunnel.rx, tunnel.tx, &tunnel.links);
+    }
+    println!("Link columns are down plus up. OTHER is a VPN tunnel, loopback, or an unknown link.");
+    println!("The VPN tunnel row is the encrypted copy of app traffic; it isn't in app totals.");
 }
 
 fn show_top(db: &std::path::Path, json: bool) -> Result<(), String> {

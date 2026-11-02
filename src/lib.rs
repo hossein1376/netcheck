@@ -19,6 +19,6 @@ pub use diff::{Delta, Diff, FlowKey};
 pub use engine::{Engine, Sample};
 pub use group::group_of;
 pub use ipc::fetch_top;
-pub use meter::{frame::decode_sample, Meter, SocketCount};
-pub use query::{min_hour, parse_since, UsageRow};
+pub use meter::{frame::decode_sample, Links, Meter, SocketCount};
+pub use query::{min_hour, parse_since, TunnelRow, UsageRow};
 pub use store::{By, Store, SCHEMA_VERSION};

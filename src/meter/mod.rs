@@ -10,8 +10,43 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::meter_path;
 
+/// Cumulative bytes split by the kind of link they crossed. Bytes on a VPN
+/// tunnel, loopback, or an unknown link are in the totals but none of these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Links {
+    pub wifi_rx: u64,
+    pub wifi_tx: u64,
+    pub wired_rx: u64,
+    pub wired_tx: u64,
+    pub cellular_rx: u64,
+    pub cellular_tx: u64,
+}
+
+impl Links {
+    /// Each field minus `earlier`'s, saturating at zero.
+    pub fn since(&self, earlier: &Links) -> Links {
+        Links {
+            wifi_rx: self.wifi_rx.saturating_sub(earlier.wifi_rx),
+            wifi_tx: self.wifi_tx.saturating_sub(earlier.wifi_tx),
+            wired_rx: self.wired_rx.saturating_sub(earlier.wired_rx),
+            wired_tx: self.wired_tx.saturating_sub(earlier.wired_tx),
+            cellular_rx: self.cellular_rx.saturating_sub(earlier.cellular_rx),
+            cellular_tx: self.cellular_tx.saturating_sub(earlier.cellular_tx),
+        }
+    }
+
+    pub fn add(&mut self, other: &Links) {
+        self.wifi_rx += other.wifi_rx;
+        self.wifi_tx += other.wifi_tx;
+        self.wired_rx += other.wired_rx;
+        self.wired_tx += other.wired_tx;
+        self.cellular_rx += other.cellular_rx;
+        self.cellular_tx += other.cellular_tx;
+    }
+}
+
 /// One cumulative socket counter from a meter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SocketCount {
     /// Meter-assigned id. Unique for one meter run.
     pub source: u64,
@@ -29,10 +64,17 @@ pub struct SocketCount {
     pub tx: u64,
     /// Executable path, read by the meter when it first saw the socket.
     pub path: Option<String>,
+    /// The process this socket works for, when that is another process
+    /// (WebKit for Safari, nsurlsessiond for an app). 0 otherwise.
+    pub effective_pid: u32,
+    pub effective_path: Option<String>,
+    /// The same bytes as `rx` and `tx`, split by link kind.
+    pub links: Links,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Proto {
+    #[default]
     Tcp,
     Udp,
 }

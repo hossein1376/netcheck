@@ -1,11 +1,11 @@
-//! NC02: how the macOS meter streams snapshots to the daemon. Other meters
+//! NC03: how the macOS meter streams snapshots to the daemon. Other meters
 //! produce [`SocketCount`] directly.
 
-use super::{Proto, SocketCount};
+use super::{Links, Proto, SocketCount};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-pub const MAGIC: &[u8] = b"NC02";
+pub const MAGIC: &[u8] = b"NC03";
 
 #[derive(Debug)]
 pub enum FrameError {
@@ -22,7 +22,7 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Truncated => write!(f, "truncated meter frame"),
-            FrameError::BadMagic => write!(f, "meter stream is not NC02"),
+            FrameError::BadMagic => write!(f, "meter stream is not NC03"),
             FrameError::BadType(v) => write!(f, "unknown frame type {v}"),
             FrameError::BadProto(v) => write!(f, "unknown proto {v}"),
             FrameError::BadFamily(v) => write!(f, "unknown address family {v}"),
@@ -144,8 +144,8 @@ fn read_payload(reader: &mut impl Read) -> Result<Vec<u8>, FrameError> {
 
 fn parse_socket(payload: &[u8]) -> Result<SocketCount, FrameError> {
     // type, source, flags, pid, start, proto, name_len, name[64], local, remote, rx, tx,
-    // path_len, path
-    if payload.len() < 144 {
+    // effective pid, link counters[6], path_len, path, effective path_len, effective path
+    if payload.len() < 198 {
         return Err(FrameError::Truncated);
     }
     let source = u64::from_le_bytes(payload[1..9].try_into().unwrap());
@@ -166,20 +166,19 @@ fn parse_socket(payload: &[u8]) -> Result<SocketCount, FrameError> {
     let mut cursor = &payload[88..];
     let local = take_addr(&mut cursor)?;
     let remote = take_addr(&mut cursor)?;
-    if cursor.len() < 18 {
-        return Err(FrameError::Truncated);
-    }
-    let rx = u64::from_le_bytes(cursor[0..8].try_into().unwrap());
-    let tx = u64::from_le_bytes(cursor[8..16].try_into().unwrap());
-    let path_len = u16::from_le_bytes([cursor[16], cursor[17]]) as usize;
-    let cursor = &cursor[18..];
-    if cursor.len() < path_len {
-        return Err(FrameError::Truncated);
-    }
-    let path = std::str::from_utf8(&cursor[..path_len])
-        .ok()
-        .filter(|text| text.starts_with('/'))
-        .map(str::to_owned);
+    let rx = take_u64(&mut cursor)?;
+    let tx = take_u64(&mut cursor)?;
+    let effective_pid = take_u32(&mut cursor)?;
+    let links = Links {
+        wifi_rx: take_u64(&mut cursor)?,
+        wifi_tx: take_u64(&mut cursor)?,
+        wired_rx: take_u64(&mut cursor)?,
+        wired_tx: take_u64(&mut cursor)?,
+        cellular_rx: take_u64(&mut cursor)?,
+        cellular_tx: take_u64(&mut cursor)?,
+    };
+    let path = take_path(&mut cursor)?;
+    let effective_path = take_path(&mut cursor)?;
     Ok(SocketCount {
         source,
         new,
@@ -193,7 +192,34 @@ fn parse_socket(payload: &[u8]) -> Result<SocketCount, FrameError> {
         rx,
         tx,
         path,
+        effective_pid,
+        effective_path,
+        links,
     })
+}
+
+fn take_u32(input: &mut &[u8]) -> Result<u32, FrameError> {
+    let (head, rest) = input.split_at_checked(4).ok_or(FrameError::Truncated)?;
+    *input = rest;
+    Ok(u32::from_le_bytes(head.try_into().unwrap()))
+}
+
+fn take_u64(input: &mut &[u8]) -> Result<u64, FrameError> {
+    let (head, rest) = input.split_at_checked(8).ok_or(FrameError::Truncated)?;
+    *input = rest;
+    Ok(u64::from_le_bytes(head.try_into().unwrap()))
+}
+
+/// A u16 length, then UTF-8. Only absolute paths count; anything else is `None`.
+fn take_path(input: &mut &[u8]) -> Result<Option<String>, FrameError> {
+    let (len, rest) = input.split_at_checked(2).ok_or(FrameError::Truncated)?;
+    let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+    let (text, rest) = rest.split_at_checked(len).ok_or(FrameError::Truncated)?;
+    *input = rest;
+    Ok(std::str::from_utf8(text)
+        .ok()
+        .filter(|text| text.starts_with('/'))
+        .map(str::to_owned))
 }
 
 #[cfg(test)]
@@ -276,9 +302,16 @@ fn encode_sample(sockets: &[SocketCount]) -> Vec<u8> {
         put_addr(&mut payload, sock.remote);
         payload.extend_from_slice(&sock.rx.to_le_bytes());
         payload.extend_from_slice(&sock.tx.to_le_bytes());
-        let path = sock.path.as_deref().unwrap_or("").as_bytes();
-        payload.extend_from_slice(&(path.len() as u16).to_le_bytes());
-        payload.extend_from_slice(path);
+        payload.extend_from_slice(&sock.effective_pid.to_le_bytes());
+        let l = sock.links;
+        for value in [l.wifi_rx, l.wifi_tx, l.wired_rx, l.wired_tx, l.cellular_rx, l.cellular_tx] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for text in [&sock.path, &sock.effective_path] {
+            let bytes = text.as_deref().unwrap_or("").as_bytes();
+            payload.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            payload.extend_from_slice(bytes);
+        }
         out.extend(msg(&payload));
     }
 
@@ -306,6 +339,15 @@ mod tests {
             rx: 1000,
             tx: 200,
             path: Some("/usr/bin/curl".into()),
+            effective_pid: 77,
+            effective_path: Some("/Applications/Safari.app/Contents/MacOS/Safari".into()),
+            links: Links {
+                wifi_rx: 600,
+                wifi_tx: 100,
+                cellular_rx: 400,
+                cellular_tx: 100,
+                ..Links::default()
+            },
         }
     }
 
@@ -324,6 +366,9 @@ mod tests {
         quiet.new = false;
         quiet.closed = true;
         quiet.path = None;
+        quiet.effective_pid = 0;
+        quiet.effective_path = None;
+        quiet.links = Links::default();
         let bytes = encode_sample(&[quiet.clone()]);
         let decoded = decode_sample(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded, vec![quiet]);

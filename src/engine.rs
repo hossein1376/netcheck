@@ -1,7 +1,7 @@
 use crate::classify::{classify, Prefix, Scope};
 use crate::diff::Diff;
 use crate::group::group_of;
-use crate::meter::SocketCount;
+use crate::meter::{Links, SocketCount};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
@@ -24,6 +24,8 @@ pub struct Buckets {
     pub local_tx: u64,
     pub unscoped_rx: u64,
     pub unscoped_tx: u64,
+    /// The same bytes across all scopes, split by link kind.
+    pub links: Links,
 }
 
 impl Buckets {
@@ -34,9 +36,11 @@ impl Buckets {
         self.local_tx += other.local_tx;
         self.unscoped_rx += other.unscoped_rx;
         self.unscoped_tx += other.unscoped_tx;
+        self.links.add(&other.links);
     }
 
-    fn add(&mut self, scope: Scope, rx: u64, tx: u64) {
+    fn add(&mut self, scope: Scope, rx: u64, tx: u64, links: &Links) {
+        self.links.add(links);
         match scope {
             Scope::Internet => {
                 self.internet_rx += rx;
@@ -51,6 +55,28 @@ impl Buckets {
                 self.unscoped_tx += tx;
             }
         }
+    }
+}
+
+/// Bytes a VPN process sent and received for the tunnel. The apps inside the
+/// tunnel are counted already, so these stay out of app totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Encap {
+    pub rx: u64,
+    pub tx: u64,
+    /// Which physical links carried the tunnel.
+    pub links: Links,
+}
+
+impl Encap {
+    pub(crate) fn merge(&mut self, other: &Encap) {
+        self.rx += other.rx;
+        self.tx += other.tx;
+        self.links.add(&other.links);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rx == 0 && self.tx == 0
     }
 }
 
@@ -98,11 +124,10 @@ impl Engine {
         sample: &Sample,
         now: SystemTime,
         prefixes: &[Prefix],
-    ) -> (Vec<AppDelta>, u64, u64) {
+    ) -> (Vec<AppDelta>, Encap) {
         let hour = hour_index(now);
         let mut by_app: HashMap<(String, String), Buckets> = HashMap::new();
-        let mut encap_rx = 0u64;
-        let mut encap_tx = 0u64;
+        let mut encap = Encap::default();
         for sock in &sample.sockets {
             let delta = self.diff.observe(sock);
             if sock.closed {
@@ -111,20 +136,25 @@ impl Engine {
             if delta.fresh || (delta.rx == 0 && delta.tx == 0) {
                 continue;
             }
-            let (app_key, display) = app_identity(sock);
+            // Tunnel daemons are recognised by the process that owns the socket.
+            let (real_key, real_name) = process_identity(sock.path.as_deref(), &sock.name);
             if is_excluded(&self.exclude, &sock.name)
-                || is_excluded(&self.exclude, &display)
-                || is_excluded(&self.exclude, file_name(&app_key))
+                || is_excluded(&self.exclude, &real_name)
+                || is_excluded(&self.exclude, file_name(&real_key))
             {
-                encap_rx += delta.rx;
-                encap_tx += delta.tx;
+                encap.merge(&Encap {
+                    rx: delta.rx,
+                    tx: delta.tx,
+                    links: delta.links,
+                });
                 continue;
             }
+            let (app_key, display) = app_identity(sock);
             let scope = classify(local_port(sock), remote_ip(sock), prefixes);
             by_app
                 .entry((app_key, display))
                 .or_default()
-                .add(scope, delta.rx, delta.tx);
+                .add(scope, delta.rx, delta.tx, &delta.links);
         }
 
         let apps = by_app
@@ -141,7 +171,7 @@ impl Engine {
                 }
             })
             .collect();
-        (apps, encap_rx, encap_tx)
+        (apps, encap)
     }
 }
 
@@ -153,19 +183,31 @@ pub fn default_exclude() -> &'static [&'static str] {
         "wireguard-go",
         "wireguard",
         "wg",
+        "kvpncsvc",
     ]
+}
+
+/// Who the bytes are for: the effective process when the socket works on
+/// another's behalf and its path is known, otherwise the owning process.
+fn app_identity(sock: &SocketCount) -> (String, String) {
+    if sock.effective_pid != 0 {
+        if let Some(path) = &sock.effective_path {
+            return (path.clone(), file_name(path).to_string());
+        }
+    }
+    process_identity(sock.path.as_deref(), &sock.name)
 }
 
 /// The executable path when known. Otherwise the process name, so short-lived
 /// processes that exited before the meter saw them still group together.
-fn app_identity(sock: &SocketCount) -> (String, String) {
-    if let Some(path) = &sock.path {
-        return (path.clone(), file_name(path).to_string());
+fn process_identity(path: Option<&str>, name: &str) -> (String, String) {
+    if let Some(path) = path {
+        return (path.to_string(), file_name(path).to_string());
     }
-    if sock.name.is_empty() {
+    if name.is_empty() {
         return ("name:unknown".into(), "unknown".into());
     }
-    (format!("name:{}", sock.name), sock.name.clone())
+    (format!("name:{name}"), name.to_string())
 }
 
 pub(crate) fn file_name(path: &str) -> &str {
@@ -210,6 +252,7 @@ mod tests {
             rx,
             tx: 10,
             path: Some("/usr/bin/curl".into()),
+            ..SocketCount::default()
         }
     }
 
@@ -222,12 +265,12 @@ mod tests {
             now,
             &[],
         );
-        let (apps, encap_rx, _) = engine.ingest(
+        let (apps, encap) = engine.ingest(
             &Sample { sockets: vec![curl(6_000, "1.1.1.1:443")] },
             now,
             &[],
         );
-        assert_eq!(encap_rx, 0);
+        assert_eq!(encap.rx, 0);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].app_key, "/usr/bin/curl");
         assert_eq!(apps[0].display_name, "curl");
@@ -248,14 +291,14 @@ mod tests {
             &[],
         );
         sock.rx = 9_100;
-        let (apps, encap_rx, encap_tx) = engine.ingest(
+        let (apps, encap) = engine.ingest(
             &Sample { sockets: vec![sock] },
             now,
             &[],
         );
         assert!(apps.is_empty());
-        assert_eq!(encap_rx, 9_000);
-        assert_eq!(encap_tx, 0);
+        assert_eq!(encap.rx, 9_000);
+        assert_eq!(encap.tx, 0);
     }
 
     #[test]
@@ -265,14 +308,14 @@ mod tests {
         let mut born = curl(1_000_000, "1.1.1.1:443");
         born.source = 99;
         born.new = true;
-        let (apps, _, _) = engine.ingest(
+        let (apps, _) = engine.ingest(
             &Sample { sockets: vec![born.clone()] },
             now,
             &[],
         );
         assert_eq!(apps[0].buckets.internet_rx, 1_000_000);
         born.rx = 1_050_000;
-        let (apps, _, _) = engine.ingest(
+        let (apps, _) = engine.ingest(
             &Sample { sockets: vec![born] },
             now,
             &[],
@@ -293,7 +336,7 @@ mod tests {
             sock.path = None;
             socks.push(sock);
         }
-        let (apps, _, _) = engine.ingest(&Sample { sockets: socks }, now, &[]);
+        let (apps, _) = engine.ingest(&Sample { sockets: socks }, now, &[]);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].app_key, "name:curl");
         assert_eq!(apps[0].display_name, "curl");
@@ -306,9 +349,39 @@ mod tests {
         let now = at(100);
         engine.ingest(&Sample { sockets: vec![curl(1_000, "1.1.1.1:443")] }, now, &[]);
         engine.reset_flows();
-        let (apps, _, _) =
+        let (apps, _) =
             engine.ingest(&Sample { sockets: vec![curl(9_000, "1.1.1.1:443")] }, now, &[]);
         assert!(apps.is_empty(), "a reused source id must not bill across runs");
+    }
+
+    #[test]
+    fn delegated_traffic_counts_for_the_effective_app() {
+        let mut engine = Engine::new(default_exclude());
+        let mut sock = curl(5_000, "1.1.1.1:443");
+        sock.new = true;
+        sock.name = "com.apple.WebKit.Networking".into();
+        sock.path = Some("/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking".into());
+        sock.effective_pid = 77;
+        sock.effective_path = Some("/Applications/Safari.app/Contents/MacOS/Safari".into());
+        sock.links = Links { wifi_rx: 5_000, wifi_tx: 10, ..Links::default() };
+        let (apps, _) = engine.ingest(&Sample { sockets: vec![sock] }, at(100), &[]);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].group_name, "Safari");
+        assert_eq!(apps[0].buckets.internet_rx, 5_000);
+        assert_eq!(apps[0].buckets.links.wifi_rx, 5_000);
+    }
+
+    #[test]
+    fn a_tunnel_keeps_its_link_split_out_of_app_totals() {
+        let mut engine = Engine::new(default_exclude());
+        let mut tunnel = curl(8_000, "185.65.135.1:51820");
+        tunnel.new = true;
+        tunnel.name = "mullvad-daemon".into();
+        tunnel.path = Some("/Applications/Mullvad VPN.app/Contents/Resources/mullvad-daemon".into());
+        tunnel.links = Links { wifi_rx: 8_000, wifi_tx: 10, ..Links::default() };
+        let (apps, encap) = engine.ingest(&Sample { sockets: vec![tunnel] }, at(100), &[]);
+        assert!(apps.is_empty());
+        assert_eq!(encap.links.wifi_rx, 8_000);
     }
 
     #[test]
@@ -322,7 +395,7 @@ mod tests {
         );
         let mut sock = curl(410, "192.168.1.20:80");
         sock.tx = 10;
-        let (apps, _, _) = engine.ingest(
+        let (apps, _) = engine.ingest(
             &Sample { sockets: vec![sock] },
             now,
             &[],

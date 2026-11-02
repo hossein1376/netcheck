@@ -42,6 +42,15 @@ extern CFStringRef kNStatSrcKeyUUID;
 static NSString *const kNCNew = @"netcheck.new";
 static NSString *const kNCStart = @"netcheck.start";
 static NSString *const kNCPath = @"netcheck.path";
+static NSString *const kNCEffectivePID = @"netcheck.epid";
+static NSString *const kNCEffectivePath = @"netcheck.epath";
+
+// Keys NetworkStatistics uses in its dictionaries without exporting a symbol.
+static NSString *const kEffectivePID = @"epid";
+static NSString *const kEffectiveUUID = @"euuid";
+static NSString *const kLinkCounters[6] = {
+    @"rxWiFiBytes", @"txWiFiBytes", @"rxWiredBytes", @"txWiredBytes", @"rxCellularBytes", @"txCellularBytes",
+};
 // Counters as last reported, to skip unchanged sockets.
 static NSString *const kNCSentRx = @"netcheck.sent_rx";
 static NSString *const kNCSentTx = @"netcheck.sent_tx";
@@ -67,6 +76,24 @@ static dispatch_source_t g_stops[2];
 static int g_ticks = 0;
 
 // Record the owning process once, while it is most likely still alive.
+// Executable path of a process. Falls back to the UUID cache when the process
+// is already gone, and teaches the cache when it is not.
+static NSString *resolve_path(pid_t pid, id uuid) {
+    char buf[PROC_PIDPATHINFO_MAXSIZE];
+    int n = proc_pidpath(pid, buf, sizeof(buf));
+    if (n > 0) {
+        NSString *path = [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
+        if (uuid != nil && path.length > 0) {
+            g_paths[uuid] = path;
+        }
+        return path;
+    }
+    return uuid != nil ? (g_paths[uuid] ?: @"") : @"";
+}
+
+// Record the owning process once, while it is most likely still alive. When a
+// socket works on behalf of another process (WebKit for Safari, nsurlsessiond
+// for an app), record that effective process too.
 static void note_process(NSMutableDictionary *event) {
     if (event[kNCStart] != nil) {
         return;
@@ -80,20 +107,13 @@ static void note_process(NSMutableDictionary *event) {
     if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == (int)sizeof(info)) {
         start = info.pbi_start_tvsec;
     }
-    NSString *path = @"";
-    id uuid = event[(__bridge NSString *)kNStatSrcKeyUUID];
-    char buf[PROC_PIDPATHINFO_MAXSIZE];
-    int n = proc_pidpath(pid, buf, sizeof(buf));
-    if (n > 0) {
-        path = [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
-        if (uuid != nil && path.length > 0) {
-            g_paths[uuid] = path;
-        }
-    } else if (uuid != nil) {
-        path = g_paths[uuid] ?: @"";
-    }
     event[kNCStart] = @(start);
-    event[kNCPath] = path;
+    event[kNCPath] = resolve_path(pid, event[(__bridge NSString *)kNStatSrcKeyUUID]);
+    pid_t epid = [event[kEffectivePID] intValue];
+    if (epid > 0 && epid != pid) {
+        event[kNCEffectivePID] = @(epid);
+        event[kNCEffectivePath] = resolve_path(epid, event[kEffectiveUUID]);
+    }
 }
 
 static void merge_event(NSNumber *key, NSDictionary *update) {
@@ -226,7 +246,11 @@ static int write_snapshot(BOOL requested) {
         NSData *path_utf = [path dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
         uint16_t path_len = (uint16_t)MIN((NSUInteger)PROC_PIDPATHINFO_MAXSIZE, path_utf.length);
 
-        NSMutableData *payload = [NSMutableData dataWithCapacity:144 + path_len];
+        NSString *epath = event[kNCEffectivePath] ?: @"";
+        NSData *epath_utf = [epath dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+        uint16_t epath_len = (uint16_t)MIN((NSUInteger)PROC_PIDPATHINFO_MAXSIZE, epath_utf.length);
+
+        NSMutableData *payload = [NSMutableData dataWithCapacity:198 + path_len + epath_len];
         uint8_t socket_kind = 2;
         [payload appendBytes:&socket_kind length:1];
         append_u64(payload, key.unsignedLongLongValue);
@@ -242,8 +266,14 @@ static int write_snapshot(BOOL requested) {
         append_addr(payload, event[(__bridge NSString *)kNStatSrcKeyRemote]);
         append_u64(payload, rx);
         append_u64(payload, tx);
+        append_u32(payload, [event[kNCEffectivePID] unsignedIntValue]);
+        for (int i = 0; i < 6; i++) {
+            append_u64(payload, [event[kLinkCounters[i]] unsignedLongLongValue]);
+        }
         append_u16(payload, path_len);
         [payload appendBytes:path_utf.bytes length:path_len];
+        append_u16(payload, epath_len);
+        [payload appendBytes:epath_utf.bytes length:epath_len];
         if (write_msg(payload) != 0) {
             return -1;
         }
@@ -334,7 +364,7 @@ int main(int argc, char **argv) {
         NStatManagerAddAllTCPWithFilter(g_manager, 0, 0);
         NStatManagerAddAllUDPWithFilter(g_manager, 0, 0);
 
-        if (fwrite("NC02", 1, 4, stdout) != 4) {
+        if (fwrite("NC03", 1, 4, stdout) != 4) {
             return 1;
         }
         fflush(stdout);

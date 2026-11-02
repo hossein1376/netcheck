@@ -1,4 +1,4 @@
-use crate::engine::{default_exclude, AppDelta, Engine, Sample};
+use crate::engine::{default_exclude, AppDelta, Encap, Engine, Sample};
 use crate::live::LiveWindow;
 use crate::meter::{self, Cadence, Meter, SocketCount};
 use crate::classify::Prefix;
@@ -34,6 +34,9 @@ pub fn run_daemon(db: &Path) -> Result<(), String> {
     let _lock = platform::lock_instance(&lock_path(db))
         .map_err(|err| format!("{err} for {}", db.display()))?;
     let store = Store::open(db).map_err(|err| err.to_string())?;
+    if let Some(dir) = db.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        platform::share_with_readers(dir);
+    }
     let live = Arc::new(Mutex::new(LiveWindow::new()));
     let watched = Arc::new(AtomicU64::new(0));
     crate::ipc::serve(db, Arc::clone(&live), Arc::clone(&watched))?;
@@ -150,11 +153,13 @@ impl Daemon<'_> {
     fn ingest(&mut self, sockets: Vec<SocketCount>, prefixes: &[Prefix]) -> usize {
         let count = sockets.len();
         let now = SystemTime::now();
-        let (apps, encap_rx, encap_tx) = self.engine.ingest(&Sample { sockets }, now, prefixes);
-        if encap_rx > 0 || encap_tx > 0 {
-            let entry = self.pending.encap.entry(crate::engine::hour_index(now)).or_insert((0, 0));
-            entry.0 += encap_rx;
-            entry.1 += encap_tx;
+        let (apps, encap) = self.engine.ingest(&Sample { sockets }, now, prefixes);
+        if !encap.is_empty() {
+            self.pending
+                .encap
+                .entry(crate::engine::hour_index(now))
+                .or_default()
+                .merge(&encap);
         }
         if let Ok(mut window) = self.live.lock() {
             window.push(unix_now(), &apps);
@@ -205,7 +210,7 @@ impl Daemon<'_> {
 #[derive(Default)]
 struct Pending {
     apps: HashMap<(i64, String), AppDelta>,
-    encap: HashMap<i64, (u64, u64)>,
+    encap: HashMap<i64, Encap>,
 }
 
 impl Pending {

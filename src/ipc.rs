@@ -10,8 +10,6 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,7 +43,7 @@ pub fn serve(db: &Path, live: Arc<Mutex<LiveWindow>>, watched: Arc<AtomicU64>) -
     }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).map_err(|err| format!("bind {}: {err}", path.display()))?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    crate::platform::share_with_readers(&path);
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(stream) = conn else { continue };

@@ -1,17 +1,18 @@
-use crate::engine::{AppDelta, Buckets};
+use crate::engine::{AppDelta, Buckets, Encap};
 use crate::group::group_of;
-use crate::query::UsageRow;
+use crate::meter::Links;
+use crate::query::{TunnelRow, UsageRow};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 
 /// Schema version this build reads and writes, kept in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Ordered upgrades. Step `i` takes the database from version `i` to `i + 1`.
 /// Append new steps; never edit a released one.
 const MIGRATIONS: [fn(&Connection) -> rusqlite::Result<()>; SCHEMA_VERSION as usize] =
-    [base_tables, app_groups];
+    [base_tables, app_groups, link_bytes];
 
 /// v1: the tables from the first release. A database made before versioning
 /// is at v0 with these tables already present, so this is a no-op there.
@@ -72,6 +73,50 @@ fn apply(
     migrate(&tx)?;
     tx.pragma_update(None, "user_version", to)?;
     tx.commit()
+}
+
+/// v3: bytes split by link kind (Wi-Fi, wired, cellular) for apps and for the
+/// VPN tunnel. Older rows have zeros there.
+fn link_bytes(conn: &Connection) -> rusqlite::Result<()> {
+    for table in ["usage_hour", "encapsulation_hour"] {
+        for column in LINK_COLUMNS {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+const LINK_COLUMNS: [&str; 6] = [
+    "wifi_rx",
+    "wifi_tx",
+    "wired_rx",
+    "wired_tx",
+    "cellular_rx",
+    "cellular_tx",
+];
+
+fn link_values(links: &Links) -> [u64; 6] {
+    [
+        links.wifi_rx,
+        links.wifi_tx,
+        links.wired_rx,
+        links.wired_tx,
+        links.cellular_rx,
+        links.cellular_tx,
+    ]
+}
+
+fn links_at(row: &rusqlite::Row, first: usize) -> rusqlite::Result<Links> {
+    Ok(Links {
+        wifi_rx: row.get(first)?,
+        wifi_tx: row.get(first + 1)?,
+        wired_rx: row.get(first + 2)?,
+        wired_tx: row.get(first + 3)?,
+        cellular_rx: row.get(first + 4)?,
+        cellular_tx: row.get(first + 5)?,
+    })
 }
 
 fn user_version(conn: &Connection) -> rusqlite::Result<i64> {
@@ -143,8 +188,8 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Add deltas to their hours in one transaction. `encap` maps hour to (rx, tx).
-    pub fn flush(&self, apps: &[AppDelta], encap: &HashMap<i64, (u64, u64)>) -> rusqlite::Result<()> {
+    /// Add deltas to their hours in one transaction.
+    pub fn flush(&self, apps: &[AppDelta], encap: &HashMap<i64, Encap>) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for app in apps {
             let id: i64 = tx.query_row(
@@ -158,17 +203,25 @@ impl Store {
                 |row| row.get(0),
             )?;
             let b: &Buckets = &app.buckets;
+            let l = link_values(&b.links);
             tx.execute(
                 "INSERT INTO usage_hour (
-                    app_id, hour_utc, internet_rx, internet_tx, local_rx, local_tx, unscoped_rx, unscoped_tx
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    app_id, hour_utc, internet_rx, internet_tx, local_rx, local_tx, unscoped_rx, unscoped_tx,
+                    wifi_rx, wifi_tx, wired_rx, wired_tx, cellular_rx, cellular_tx
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(app_id, hour_utc) DO UPDATE SET
                     internet_rx = internet_rx + excluded.internet_rx,
                     internet_tx = internet_tx + excluded.internet_tx,
                     local_rx = local_rx + excluded.local_rx,
                     local_tx = local_tx + excluded.local_tx,
                     unscoped_rx = unscoped_rx + excluded.unscoped_rx,
-                    unscoped_tx = unscoped_tx + excluded.unscoped_tx",
+                    unscoped_tx = unscoped_tx + excluded.unscoped_tx,
+                    wifi_rx = wifi_rx + excluded.wifi_rx,
+                    wifi_tx = wifi_tx + excluded.wifi_tx,
+                    wired_rx = wired_rx + excluded.wired_rx,
+                    wired_tx = wired_tx + excluded.wired_tx,
+                    cellular_rx = cellular_rx + excluded.cellular_rx,
+                    cellular_tx = cellular_tx + excluded.cellular_tx",
                 params![
                     id,
                     app.hour,
@@ -177,20 +230,35 @@ impl Store {
                     b.local_rx,
                     b.local_tx,
                     b.unscoped_rx,
-                    b.unscoped_tx
+                    b.unscoped_tx,
+                    l[0],
+                    l[1],
+                    l[2],
+                    l[3],
+                    l[4],
+                    l[5]
                 ],
             )?;
         }
-        for (hour, (encap_rx, encap_tx)) in encap {
-            if *encap_rx == 0 && *encap_tx == 0 {
+        for (hour, bytes) in encap {
+            if bytes.is_empty() {
                 continue;
             }
+            let l = link_values(&bytes.links);
             tx.execute(
-                "INSERT INTO encapsulation_hour (hour_utc, rx, tx) VALUES (?1, ?2, ?3)
+                "INSERT INTO encapsulation_hour (
+                    hour_utc, rx, tx, wifi_rx, wifi_tx, wired_rx, wired_tx, cellular_rx, cellular_tx
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(hour_utc) DO UPDATE SET
                     rx = rx + excluded.rx,
-                    tx = tx + excluded.tx",
-                params![hour, encap_rx, encap_tx],
+                    tx = tx + excluded.tx,
+                    wifi_rx = wifi_rx + excluded.wifi_rx,
+                    wifi_tx = wifi_tx + excluded.wifi_tx,
+                    wired_rx = wired_rx + excluded.wired_rx,
+                    wired_tx = wired_tx + excluded.wired_tx,
+                    cellular_rx = cellular_rx + excluded.cellular_rx,
+                    cellular_tx = cellular_tx + excluded.cellular_tx",
+                params![hour, bytes.rx, bytes.tx, l[0], l[1], l[2], l[3], l[4], l[5]],
             )?;
         }
         tx.commit()
@@ -210,7 +278,9 @@ impl Store {
             "SELECT {key}, {name},
                     SUM(u.internet_rx), SUM(u.internet_tx),
                     SUM(u.local_rx), SUM(u.local_tx),
-                    SUM(u.unscoped_rx), SUM(u.unscoped_tx)
+                    SUM(u.unscoped_rx), SUM(u.unscoped_tx),
+                    SUM(u.wifi_rx), SUM(u.wifi_tx), SUM(u.wired_rx), SUM(u.wired_tx),
+                    SUM(u.cellular_rx), SUM(u.cellular_tx)
              FROM usage_hour u
              JOIN app a ON a.id = u.app_id
              WHERE u.hour_utc >= ?1
@@ -230,9 +300,29 @@ impl Store {
                 local_tx: row.get(5)?,
                 unscoped_rx: row.get(6)?,
                 unscoped_tx: row.get(7)?,
+                links: links_at(row, 8)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// VPN tunnel totals since `min_hour`.
+    pub fn tunnel(&self, min_hour: i64) -> rusqlite::Result<TunnelRow> {
+        self.conn.query_row(
+            "SELECT COALESCE(SUM(rx), 0), COALESCE(SUM(tx), 0),
+                    COALESCE(SUM(wifi_rx), 0), COALESCE(SUM(wifi_tx), 0),
+                    COALESCE(SUM(wired_rx), 0), COALESCE(SUM(wired_tx), 0),
+                    COALESCE(SUM(cellular_rx), 0), COALESCE(SUM(cellular_tx), 0)
+             FROM encapsulation_hour WHERE hour_utc >= ?1",
+            params![min_hour],
+            |row| {
+                Ok(TunnelRow {
+                    rx: row.get(0)?,
+                    tx: row.get(1)?,
+                    links: links_at(row, 2)?,
+                })
+            },
+        )
     }
 
     pub fn hour_rows(&self) -> rusqlite::Result<i64> {
@@ -263,6 +353,10 @@ mod tests {
             hour: 10,
             buckets: Buckets {
                 internet_rx: rx,
+                links: Links {
+                    wifi_rx: rx,
+                    ..Links::default()
+                },
                 ..Buckets::default()
             },
         }
@@ -273,7 +367,10 @@ mod tests {
         let path = scratch("store");
         let store = Store::open(&path).unwrap();
         store
-            .flush(&[delta("/usr/bin/curl", "curl", 100)], &HashMap::from([(10, (7, 1))]))
+            .flush(
+                &[delta("/usr/bin/curl", "curl", 100)],
+                &HashMap::from([(10, Encap { rx: 7, tx: 1, links: Links { wifi_rx: 7, ..Links::default() } })]),
+            )
             .unwrap();
         store
             .flush(&[delta("/usr/bin/curl", "curl", 40)], &HashMap::new())
@@ -282,6 +379,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "curl");
         assert_eq!(rows[0].internet_rx, 140);
+        assert_eq!(rows[0].links.wifi_rx, 140);
+        let tunnel = store.tunnel(10).unwrap();
+        assert_eq!((tunnel.rx, tunnel.links.wifi_rx), (7, 7));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

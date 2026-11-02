@@ -21,32 +21,32 @@ netcheck records how much each app sends and receives, split into internet, loca
 
 **Lowest overhead is the deciding criterion.** When designs compete, the one with less CPU, fewer wakeups and less memory wins, even if it adds a language such as C.
 
-**Measured overhead (macOS, 2026-11-01):** measured with `scripts/overhead.py`, before and after the 10 s cadence and changed-only snapshots.
+**Measured overhead (macOS):** measured with `scripts/overhead.py`. Three columns: the 1 s cadence (2026-11-01), the 10 s cadence with changed-only snapshots running as a user, and the same running as root (2026-11-02). As root the meter sees about twice as many sockets, every process's instead of one user's.
 
-| Scenario | Process | CPU s/hour before → after | Wakeups/s before → after | Memory after |
+| Scenario | Process | CPU s/hour: 1 s → 10 s → root | Wakeups/s: 1 s → 10 s → root | Memory as root |
 | --- | --- | --- | --- | --- |
-| Idle, 120 s | meter | 9.2 → 1.0 | 0.98 → 0.19 | 2.3 MB |
-| Idle, 120 s | daemon | 1.1 → 0.4 | 0 → 0 | 2.0 MB |
-| Full-speed loopback stream, 60 s | meter | 8.1 → 1.8 | 0.98 → 0.13 | 2.4 MB |
-| Full-speed loopback stream, 60 s | daemon | 1.0 → 0.3 | 0 → 0 | 2.2 MB |
-| About 130 short connections/s, 60 s | meter | 168 → 178 | 0.95 → 0.10 | 10.7 MB |
-| About 130 short connections/s, 60 s | daemon | 3.6 → 2.1 | 0 → 0 | 3.3 MB |
+| Idle, 120 s | meter | 9.2 → 1.0 → 2.4 | 0.98 → 0.19 → 0.18 | 2.6 MB |
+| Idle, 120 s | daemon | 1.1 → 0.4 → 0.4 | 0 → 0 → 0 | 2.5 MB |
+| Full-speed loopback stream, 60 s | meter | 8.1 → 1.8 → 3.0 | 0.98 → 0.13 → 0.20 | 2.6 MB |
+| Full-speed loopback stream, 60 s | daemon | 1.0 → 0.3 → 0.4 | 0 → 0 → 0 | 2.6 MB |
+| About 130 short connections/s, 60 s | meter | 168 → 178 → 178 | 0.95 → 0.10 → 0.10 | 12.1 MB |
+| About 130 short connections/s, 60 s | daemon | 3.6 → 2.1 → 2.9 | 0 → 0 → 0 | 4.0 MB |
 
-Memory is physical footprint. Wakeups are interrupt wakeups; package-idle wakeups stayed under 0.1/s throughout. While `top` keeps the meter at live cadence, it runs at about 1 wakeup/s and 12 CPU s/hour. Daemon disk writes are 12–18 KB/min: the status file every 10 s plus one SQLite transaction every 30 s.
+Memory is physical footprint. Wakeups are interrupt wakeups; package-idle wakeups stayed under 0.1/s throughout. While `top` keeps the meter at live cadence, it runs at about 1 wakeup/s and 12 CPU s/hour. Daemon disk writes are 14–20 KB/min: the status file every 10 s plus one SQLite transaction every 30 s.
 
 Under connection churn the meter costs about 0.37 ms of CPU per new connection, roughly half user and half kernel time. The cadence and snapshot changes didn't touch that path. Profiling puts most of it outside netcheck's code, in NetworkStatistics' per-socket event handling.
 
 ## Current state: macOS v1
 
-macOS v1 is running as a per-user LaunchAgent, and its accounting was verified against known loopback transfers on 2026-11-01 (commit `315d2aa`).
+macOS v1 runs as a root LaunchDaemon (`com.netcheck.daemon`), so it sees every process's sockets. Its accounting was verified against known loopback transfers on 2026-11-01. Until then it ran as a per-user LaunchAgent, which only saw that user's processes (see the decision log).
 
 | Command | What it does |
 | --- | --- |
-| `netcheck daemon` | Runs the meter and records usage (started by the LaunchAgent) |
-| `netcheck usage --since 24h [--app X] [--by-exe] [--json]` | Hourly totals per app (helpers included), or per executable with `--by-exe` |
+| `netcheck daemon` | Runs the meter and records usage (started by the LaunchDaemon) |
+| `netcheck usage --since 24h [--app X] [--by-exe] [--links] [--json]` | Hourly totals per app (helpers included), per executable with `--by-exe`, or split by link with `--links` (Wi-Fi, wired, cellular, other, plus the VPN tunnel). JSON is `{apps, vpn_tunnel}` |
 | `netcheck top [--json]` | Off-machine usage over the last 60 s, read from the daemon over a Unix socket |
 | `netcheck status` | Meter state, last sample and flush times, stored row count |
-| `netcheck install` / `uninstall` | Installs or removes the LaunchAgent and its binaries |
+| `sudo netcheck install` / `uninstall` | Installs or removes the LaunchDaemon and its binaries. Install retires the old per-user agent and copies its database |
 
 **Accuracy checks (loopback, temp database)**
 
@@ -57,7 +57,7 @@ macOS v1 is running as a per-user LaunchAgent, and its accounting was verified a
 | `curl` started after the daemon | 3 MB | 3 MB |
 | Second daemon on the same database | ran and double-counted | refused |
 
-Files live in `~/Library/Application Support/netcheck/`: `netcheck.db`, `status.json`, `netcheck.sock`, `netcheck.lock`, and `bin/`.
+Files live in `/Library/Application Support/netcheck/` (`root:admin`, mode 0750): `netcheck.db`, `status.json`, `netcheck.sock` (0660), `netcheck.lock`, and `bin/`. The log is `/Library/Logs/netcheck.log`. Members of `admin` can read usage and run `top` without `sudo`.
 
 ## Architecture
 
@@ -98,6 +98,8 @@ Every meter delivers snapshots of `SocketCount` records with cumulative counters
 | `rx`, `tx` | Bytes received and sent | Cumulative from the later of socket open or meter start; never decrease |
 | `pid`, `start_time` | Owning process and its start time (Unix s) | Captured when the meter first sees the socket |
 | `path` | Executable path | Captured on first sight; absent if the process was already gone |
+| `effective_pid`, `effective_path` | The process the socket works for, when that's another process (WebKit for Safari, `nsurlsessiond` for an app) | 0 and absent otherwise; the path is resolved on first sight, through the UUID cache if the process is gone |
+| `links` | The same bytes split into Wi-Fi, wired and cellular, received and sent | Cumulative like `rx`/`tx`; bytes on a VPN tunnel, loopback or an unknown link are in the totals but none of these |
 | `name` | Process name (up to 64 bytes) | Fallback identity when `path` is absent |
 | `proto` | TCP or UDP | Other protocols are dropped |
 | `local`, `remote` | Socket addresses | Latest known; may change during the socket's life; `remote` absent for unconnected UDP |
@@ -112,7 +114,7 @@ Every meter delivers snapshots of `SocketCount` records with cumulative counters
 
 **How the daemon turns this into usage:** first sight of a `new` socket bills its full counters; first sight of an old socket records a baseline; every later sight bills the increase. Event-based meters (Linux eBPF, Windows ETW) satisfy the contract by summing deltas per socket from attach time and marking every socket `new`.
 
-**NC02 frame (macOS):** a `NC02` magic header, then length-prefixed messages: snapshot start (a flag marks a requested snapshot), one socket record per reported socket (142 fixed bytes plus a path of up to 4,096 bytes; flag bits for `new` and `closed`), and snapshot end with a count. Little-endian throughout. The daemon controls the meter with one-byte commands on its stdin: `l` live cadence, `i` idle cadence, `n` snapshot now. When stdin closes, the meter exits.
+**NC03 frame (macOS):** a `NC03` magic header, then length-prefixed messages: snapshot start (a flag marks a requested snapshot), one socket record per reported socket (194 fixed bytes, then the path and the effective process's path, each up to 4,096 bytes; flag bits for `new` and `closed`), and snapshot end with a count. Little-endian throughout. The daemon controls the meter with one-byte commands on its stdin: `l` live cadence, `i` idle cadence, `n` snapshot now. When stdin closes, the meter exits.
 
 ## Data model and storage
 
@@ -121,14 +123,14 @@ Usage is stored as per-app hourly buckets in SQLite (WAL, `synchronous=NORMAL`),
 | Table | Key | Columns |
 | --- | --- | --- |
 | `app` | `id`; `app_key` unique | `display_name`, `group_key` (indexed), `group_name` |
-| `usage_hour` | (`app_id`, `hour_utc`) | `internet_rx/tx`, `local_rx/tx`, `unscoped_rx/tx` (bytes) |
-| `encapsulation_hour` | `hour_utc` | `rx`, `tx`: VPN tunnel bytes kept out of app totals |
+| `usage_hour` | (`app_id`, `hour_utc`) | `internet_rx/tx`, `local_rx/tx`, `unscoped_rx/tx`, and the same bytes by link: `wifi_rx/tx`, `wired_rx/tx`, `cellular_rx/tx` |
+| `encapsulation_hour` | `hour_utc` | `rx`, `tx` and the same link columns: VPN tunnel bytes kept out of app totals, and which physical links carried them |
 
 - **App identity:** `app_key` is the executable path. With no path, it's `name:<process name>`, so short-lived processes still group. 21 older `pid:<pid>:<start>` rows from before `315d2aa` remain and are grouped by process name.
 - **App grouping:** `group_key` is the outermost `.app` or `.appex` bundle in the path, so helpers count toward their app (`/Applications/Claude.app` → Claude). Other executables are their own group. Grouping rules for Linux and Windows aren't written yet. `usage` and `top` show groups; `usage --by-exe` shows executables.
 - **Durability:** deltas are merged in memory per app and hour, then written every 30 s in one transaction. A failed write keeps them for the next try. Up to 30 s is lost on a crash or `SIGKILL`.
 - **Off-machine** = internet + unscoped. It's what `top` shows and what the default `usage` sort uses.
-- **Schema versioning:** the version lives in `PRAGMA user_version` (currently 2). The daemon applies ordered migrations on start, each in its own transaction. The CLI opens read-only and refuses an old schema with "restart the daemon". v1 is the original tables; v2 adds the group columns and fills them for existing rows.
+- **Schema versioning:** the version lives in `PRAGMA user_version` (currently 3). The daemon applies ordered migrations on start, each in its own transaction. The CLI opens read-only and refuses an old schema with "restart the daemon". v1 is the original tables; v2 adds the group columns and fills them for existing rows; v3 adds the link columns.
 - **No retention policy.** At roughly 100 apps × 24 hours, that's about 2,400 small rows a day, so growth is slow but unbounded.
 
 ## Classification and attribution
@@ -142,19 +144,19 @@ Each socket's bytes go to one scope based on its remote address, and to one app 
 | Unscoped | No remote address and none of those ports, typically unconnected UDP |
 | Internet | Everything else |
 
-**VPN encapsulation:** traffic from processes named `mullvad-daemon`, `mullvad vpn`, `openvpn`, `wireguard-go`, `wireguard` or `wg` goes to `encapsulation_hour`, not to app totals. The tunnelled traffic is already counted under the apps that sent it, so this avoids counting it twice.
+**VPN encapsulation:** traffic from processes named `mullvad-daemon`, `mullvad vpn`, `openvpn`, `wireguard-go`, `wireguard`, `wg` or `kvpncsvc` goes to `encapsulation_hour`, not to app totals. The tunnelled traffic is already counted under the apps that sent it, so this avoids counting it twice. These daemons run as root, so this only works since the meter runs as root. Behind a VPN, apps' own link columns read as other (the tunnel); the tunnel row shows which physical link carried it.
 
 **Known attribution gaps**
 
 - **Helper processes outside bundles:** helpers inside an `.app` now group with it on macOS, but standalone binaries and Linux and Windows processes don't group yet.
-- **Delegated traffic:** some apps hand networking to another process, such as Safari to `com.apple.WebKit.Networking` or background transfers to `nsurlsessiond`. NStat reports an effective PID that could credit the right app; it isn't used yet.
+- **Delegated traffic:** some apps hand networking to another process, such as Safari to `com.apple.WebKit.Networking` or background transfers to `nsurlsessiond`. The meter now credits these sockets to the effective process, but no delegated socket has been observed yet to confirm it end to end.
 - **Shared interpreters:** every Python or Node script lands under one interpreter row.
 - **CGNAT and Tailscale:** peers in `100.64.0.0/10` count as internet, and they're double-counted against `tailscaled`'s own sockets. `tailscaled` isn't on the exclude list.
 - **Fixed exclude list:** it's hard-coded and matches process names only.
 
 ## Platform plans
 
-Each OS gets the one source that sees every socket, including UDP and connections shorter than a poll. On Linux and Windows that source needs root or admin, so the daemon there becomes a system service. Linux and Windows details are from API knowledge and haven't been prototyped.
+Each OS gets the one source that sees every socket, including UDP and connections shorter than a poll. On every OS that source needs root or admin to see other users' and system processes, so the daemon runs as a system service. Linux and Windows details are from API knowledge and haven't been prototyped.
 
 |  | macOS (shipped) | Linux (planned) | Windows (planned) |
 | --- | --- | --- | --- |
@@ -162,9 +164,9 @@ Each OS gets the one source that sees every socket, including UDP and connection
 | Data shape | Cumulative per socket | Per-event deltas, summed per socket in a BPF map | Per-event deltas, summed per connection |
 | Socket id | Meter counter | Socket cookie (unique per boot) | Meter counter per 5-tuple and PID |
 | Close signal | Removed callback | `inet_sock_set_state` to closed | Disconnect event |
-| Privilege | User | Root (`CAP_BPF`, `CAP_PERFMON`) | Administrator |
+| Privilege | Root (as a user it sees only that user's processes) | Root (`CAP_BPF`, `CAP_PERFMON`) | Administrator |
 | Minimum | macOS 13+ assumed | Kernel 5.8+ with BTF | Windows 10 1809+ assumed |
-| Runs as | LaunchAgent | systemd system unit | Windows service |
+| Runs as | LaunchDaemon | systemd system unit | Windows service |
 | Meter process | Separate (Objective-C) | In-process Rust loader; probe language open (decision 5) | In-process Rust; consumer design open (decision 6) |
 
 **Rejected sources:** Linux `sock_diag` polling (no UDP byte counters, misses short connections); Windows TCP ESTATS (TCP only, polled), WFP callout drivers (need a signed kernel driver), and SRUM (hourly and delayed).
@@ -173,9 +175,10 @@ Each OS gets the one source that sees every socket, including UDP and connection
 
 | Concern | macOS | Linux | Windows |
 | --- | --- | --- | --- |
-| Data directory | `~/Library/Application Support/netcheck` | `/var/lib/netcheck` | `%ProgramData%\netcheck` |
-| Service install | `launchctl` | systemd unit | Service Control Manager |
+| Data directory | `/Library/Application Support/netcheck` | `/var/lib/netcheck` | `%ProgramData%\netcheck` |
+| Service install | `launchctl bootstrap system` | systemd unit | Service Control Manager |
 | IPC for `top` | Unix socket | Unix socket | Named pipe |
+| Reader group | `admin` (exists on every Mac) | `netcheck` (install creates it) | to be decided |
 | Instance lock | `flock` | `flock` | `LockFileEx` or a named mutex |
 | Stop signal | `SIGINT`, `SIGTERM` | `SIGINT`, `SIGTERM` | Service control handler |
 | Local subnets | `getifaddrs` | `getifaddrs` | `GetAdaptersAddresses` |
@@ -192,11 +195,13 @@ These are settled unless new evidence reopens them. Newest first.
 
 | When | Decision | Why | Rejected |
 | --- | --- | --- | --- |
+| Built 2026-11-02 | macOS runs as a root LaunchDaemon, replacing the per-user LaunchAgent; install copies the old database | Probing showed NetworkStatistics as a user sees only that user's processes: 10 of 10 were the user's. As root it saw 21, including root, `_mdnsresponder` and `_netbios`. VPN daemons, DNS and system services were uncounted | Staying user-level |
+| Built 2026-11-02 | Each socket carries its effective process and its bytes split by link (Wi-Fi, wired, cellular); usage credits the effective process and stores the link split for apps and for the VPN tunnel | Contract changes are cheapest while there is one meter. NetworkStatistics reports `epid`, `euuid` and per-link counters | Only an interface flag per socket, which misreads sockets that move between links |
 | Built 2026-11-01 | Snapshot every 10 s, or every second for 60 s after a `top` request; one final snapshot on stop | The meter's 1 s timer was its main idle cost, and closed sockets wait for the next snapshot, so a slower cadence loses nothing | A fixed 1 s interval |
 | Built 2026-11-01 | Snapshots hold only changed sockets, plus one `closed` report per socket | Most sockets are idle in any interval; re-sending them cost meter and daemon work every snapshot | Complete snapshots |
 | Decided 2026-11-01 | Lowest runtime overhead decides between designs; other languages (C or others) are allowed where they lower it | A native, low-overhead daemon is the product goal | A single-language codebase as a constraint |
 | Decided 2026-11-01 | No CI for now; the conformance suite runs locally | Not worth the setup at this stage | A GitHub Actions matrix |
-| Decided 2026-11-01, not built | Linux and Windows run as a system service with a system-wide database readable by a `netcheck` group; IPC checks peer credentials. macOS stays a per-user LaunchAgent | eBPF and ETW need root or admin; a group keeps reads off root without a second process | Privileged meter feeding a per-user daemon; root-only reads |
+| Built 2026-11-01 (macOS) | The daemon runs as a system service with a system-wide database readable by a reader group (`admin` on macOS, `netcheck` on Linux); the socket has the same group | Every OS needs root to see other users' and system processes; a group keeps reads off root without a second process | Privileged meter feeding a per-user daemon; root-only reads |
 | Built 2026-11-01 | The macOS meter records each executable's UUID with its path, and uses it to name processes that exit before their path can be read | The conformance suite showed a process living under one poll lost its path in 2 of 3 runs | A process-name lookup, which can't tell two binaries with the same name apart |
 | Built 2026-11-01 (macOS) | Linux and Windows meters run in-process behind a `Meter` trait; the macOS subprocess becomes one implementation of it | Privilege separation was the main reason for a separate process, and the service model doesn't need it | A separate meter process on every OS |
 | Built 2026-11-01 | Schema versioning with `PRAGMA user_version` and ordered migrations, plus a `group_key` column set at write beside the raw `app_key` | Only one database to migrate today; the GUI needs grouping | Grouping applied at query time only |
@@ -208,7 +213,7 @@ These are settled unless new evidence reopens them. Newest first.
 | `315d2aa` | Pending deltas merged per app-hour, flushed in one transaction, kept on failure | No loss or double counting on database errors; bounded memory during an outage | Per-hour transactions; drop on failure |
 | `315d2aa` | `install` stops the agent, then replaces binaries by rename | Writing into a running Mach-O on arm64 leaves a stale code signature, and the next launch is killed | In-place copy |
 | `a2cc1b7` | Live `top` window kept in memory and served over a Unix socket | Avoids per-second database writes | Querying SQLite for live data |
-| `a2cc1b7` | Per-user LaunchAgent on macOS | NStat works without root and sees every user's sockets | LaunchDaemon (root) |
+| `a2cc1b7` | Per-user LaunchAgent on macOS (reversed 2026-11-02) | Assumed NStat sees every user's sockets without root; it doesn't | LaunchDaemon (root) |
 | `6dd9026` | Meter as a separate process that streams frames | Isolates the private Objective-C framework; a crash restarts only the meter | Linking NStat into the Rust binary |
 | `6dd9026` | Hourly buckets in SQLite, three scopes, VPN bytes kept apart | Small and simple to query; scopes answer "what went to the internet" | Per-flow rows; a time-series database |
 
@@ -218,7 +223,6 @@ Decisions 5 and 6 shape the meters, so settle them before each port. Decision 2 
 
 | # | Decision | Options | Recommendation | Blocks |
 | --- | --- | --- | --- | --- |
-| 1 | Contract fields to add now | Interface class (Wi-Fi, wired, cellular, tunnel, loopback); effective PID | Add both as optional fields; fill on macOS first | Metered-connection tracking, Safari and WebKit attribution |
 | 2 | How the GUI reads data | Directly from SQLite; through a versioned daemon API over IPC | Daemon API, so the schema can change underneath | IPC design, GUI |
 | 3 | Configuration | Hard-coded defaults; a `netcheck.toml` in the data directory | TOML with per-OS defaults; add `tailscaled` and tunnel handling | Exclude list, retention |
 | 4 | Retention | Keep forever; roll up to daily totals after N days | Defer; revisit when the database passes about 50 MB | Nothing yet |
@@ -266,8 +270,10 @@ The largest risk is that macOS depends on a private framework. The rest are boun
 | Up to 30 s of deltas lost on a crash or `SIGKILL` | Small undercount | Shorter flush interval if needed |
 | Bytes after the last poll of a closing socket | Checked on macOS: short TCP connections are counted to the byte by the conformance suite | Keep the case in the suite for every meter |
 | A binary's first run exits before its path is read | Recorded under `name:<process>` until the meter has seen that binary alive once | UUID cache in the meter; the cache resets when the meter restarts |
-| Attribution gaps (helpers, delegated traffic, interpreters, CGNAT) | Usage credited to the wrong row, or counted twice for Tailscale | App grouping (built for macOS bundles); open decisions 1 and 3 |
-| eBPF and ETW need root or admin | A different install and trust model from macOS | Decided: system service with a `netcheck` group |
+| Attribution gaps (standalone helpers, interpreters, CGNAT) | Usage credited to the wrong row, or counted twice for Tailscale | App grouping and effective-process attribution (built); open decision 3 |
+| Every meter needs root or admin | Install needs `sudo`; data is readable only by the reader group | Decided and built on macOS: system service with a reader group |
 | ETW event loss under load | Undercount on busy Windows machines | Report lost events in `status` |
 | Meter cost grows with connection churn | About 0.37 ms CPU per new connection on macOS, roughly 5% of a core at 130 connections/s | Not yet addressed. Leads: skip the path syscalls when the UUID cache already knows the binary; check whether NetworkStatistics filters can drop loopback sockets in the kernel (that would stop counting loopback traffic) |
 | Stopping can take up to one idle interval | The daemon notices a stop only when the next snapshot arrives, up to 10 s; launchd allows 20 s | Acceptable for now. That snapshot already holds the last interval, so nothing is lost |
+
+| No metered flag observed | NetworkStatistics may report an "expensive" (metered) flag, but every socket here was on a VPN tunnel, so none showed it. Cellular bytes are stored; a hotspot over Wi-Fi isn't yet marked as metered | Check on a machine without a VPN, or on a hotspot |

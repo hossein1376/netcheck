@@ -2,11 +2,33 @@
 
 use super::STOP;
 use crate::classify::Prefix;
+use std::ffi::CString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
 extern "C" fn handle_stop(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
+}
+
+/// Restrict `path` to root and `group`: a directory to 0750, anything else
+/// (the IPC socket) to 0660. Without root, a non-directory gets 0600 and
+/// ownership is left alone.
+pub fn share_with_group(path: &Path, group: &str) {
+    let is_dir = path.is_dir();
+    if unsafe { libc::geteuid() } != 0 {
+        if !is_dir {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        return;
+    }
+    let Ok(name) = CString::new(group) else { return };
+    let entry = unsafe { libc::getgrnam(name.as_ptr()) };
+    let gid = if entry.is_null() { None } else { Some(unsafe { (*entry).gr_gid }) };
+    let _ = std::os::unix::fs::chown(path, Some(0), gid);
+    let mode = if is_dir { 0o750 } else { 0o660 };
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
 /// Set the stop flag on SIGINT and SIGTERM.
