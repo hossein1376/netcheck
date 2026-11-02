@@ -21,6 +21,12 @@ pub fn uninstall() -> Result<(), String> {
 /// Not wired yet. The service control handler will set the stop flag.
 pub fn on_stop_signal() {}
 
+/// Sleep up to `timeout`. Returns whether a stop was requested.
+pub fn wait_for_stop(timeout: std::time::Duration) -> bool {
+    std::thread::sleep(timeout);
+    super::stop_requested()
+}
+
 /// Not wired yet. Will read GetAdaptersAddresses.
 pub fn local_prefixes() -> Vec<Prefix> {
     Vec::new()

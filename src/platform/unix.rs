@@ -6,10 +6,61 @@ use std::ffi::CString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
+
+/// Write end, then read end, of a pipe the stop handler writes to, so a
+/// sleeping thread can wait on it. -1 until `on_stop_signal`.
+static STOP_PIPE: [AtomicI32; 2] = [AtomicI32::new(-1), AtomicI32::new(-1)];
 
 extern "C" fn handle_stop(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
+    let fd = STOP_PIPE[0].load(Ordering::SeqCst);
+    if fd >= 0 {
+        // write(2) is async-signal-safe; a full pipe already wakes the reader.
+        unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+    }
+}
+
+/// Sleep up to `timeout`, waking early when a stop is requested. Returns
+/// whether a stop was requested.
+pub fn wait_for_stop(timeout: Duration) -> bool {
+    let fd = STOP_PIPE[1].load(Ordering::SeqCst);
+    if fd < 0 {
+        std::thread::sleep(timeout);
+        return STOP.load(Ordering::SeqCst);
+    }
+    let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    if !STOP.load(Ordering::SeqCst) {
+        unsafe { libc::poll(&mut poll, 1, ms) };
+    }
+    STOP.load(Ordering::SeqCst)
+}
+
+pub(super) fn require_root(what: &str) -> Result<(), String> {
+    if unsafe { libc::geteuid() } == 0 {
+        Ok(())
+    } else {
+        Err(format!("{what} needs root: run it with sudo"))
+    }
+}
+
+/// Copy an executable into place by writing a new file and renaming it over
+/// the old one. Writing into a binary that is running can crash it, and on
+/// macOS leaves a stale code signature that gets the next launch killed.
+pub(super) fn copy_exe(src: &Path, dest: &Path) -> Result<(), String> {
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(src), std::fs::canonicalize(dest)) {
+        if a == b {
+            return Ok(());
+        }
+    }
+    let tmp = dest.with_extension("new");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(src, &tmp).map_err(|err| format!("copy {} failed: {err}", src.display()))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(|err| err.to_string())?;
+    std::fs::rename(&tmp, dest).map_err(|err| format!("replace {} failed: {err}", dest.display()))?;
+    Ok(())
 }
 
 /// Restrict `path` to root and `group`: a directory to 0750, anything else
@@ -31,8 +82,19 @@ pub fn share_with_group(path: &Path, group: &str) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
-/// Set the stop flag on SIGINT and SIGTERM.
+/// Set the stop flag on SIGINT and SIGTERM, and wake `wait_for_stop`.
 pub fn on_stop_signal() {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+        for fd in fds {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            }
+        }
+        STOP_PIPE[1].store(fds[0], Ordering::SeqCst);
+        STOP_PIPE[0].store(fds[1], Ordering::SeqCst);
+    }
     unsafe {
         libc::signal(libc::SIGINT, handle_stop as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handle_stop as *const () as libc::sighandler_t);

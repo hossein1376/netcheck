@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 
 pub mod frame;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -122,6 +124,10 @@ pub fn open() -> Result<Box<dyn Meter>, String> {
     #[cfg(target_os = "macos")]
     {
         return Ok(Box::new(macos::NstatMeter::spawn()?));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(Box::new(linux::EbpfMeter::open()?));
     }
     #[allow(unreachable_code)]
     Err(format!("no meter for {} yet", std::env::consts::OS))

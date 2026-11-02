@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Measure the running netcheck daemon and meter (macOS).
+"""Measure the running netcheck daemon and meter (macOS and Linux).
 
-Reads each process's resource counters with proc_pid_rusage before and after
-a window, so no root is needed. Three scenarios:
+Reads each process's resource counters before and after a window: on macOS
+with proc_pid_rusage, on Linux from /proc plus the kernel's BPF statistics for
+the probe. Run it with sudo, since the daemon runs as root. Three scenarios:
 
   idle   the machine as it is
   bulk   one loopback stream at full speed
@@ -20,19 +21,81 @@ import subprocess
 import threading
 import time
 
-LIBSYSTEM = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-RUSAGE_INFO_V4 = 4
+import os
+import sys
 
+LINUX = sys.platform.startswith("linux")
+# The probe's programs, as named in meter/linux/netcheck.bpf.c.
+PROBE_PROGRAMS = {"tcp_sent", "tcp_received", "udp_sent", "udp_received", "udp6_sent", "udp6_received", "released"}
+PROBE = -1  # pseudo-pid for the probe's kernel time on Linux
 
-class Timebase(ctypes.Structure):
-    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+if not LINUX:
+    LIBSYSTEM = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    RUSAGE_INFO_V4 = 4
 
+    class Timebase(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
 
-TIMEBASE = Timebase()
-LIBSYSTEM.mach_timebase_info(ctypes.byref(TIMEBASE))
+    TIMEBASE = Timebase()
+    LIBSYSTEM.mach_timebase_info(ctypes.byref(TIMEBASE))
 
 
 def rusage(pid):
+    if LINUX:
+        return linux_usage(pid)
+    return mac_rusage(pid)
+
+
+def linux_usage(pid):
+    """CPU, context switches, memory and disk writes from /proc. Voluntary
+    switches stand in for wakeups: each is a sleep that later woke."""
+    if pid == PROBE:
+        return probe_usage()
+    with open(f"/proc/{pid}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    ticks = os.sysconf("SC_CLK_TCK")
+    cpu_ns = (int(fields[11]) + int(fields[12])) * 1e9 / ticks
+    voluntary = involuntary = 0
+    for task in os.listdir(f"/proc/{pid}/task"):
+        with open(f"/proc/{pid}/task/{task}/status") as f:
+            for line in f:
+                if line.startswith("voluntary_ctxt_switches"):
+                    voluntary += int(line.split()[1])
+                elif line.startswith("nonvoluntary_ctxt_switches"):
+                    involuntary += int(line.split()[1])
+    rss = 0
+    with open(f"/proc/{pid}/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                rss = int(line.split()[1]) * 1024
+    written = 0
+    with open(f"/proc/{pid}/io") as f:
+        for line in f:
+            if line.startswith("write_bytes:"):
+                written = int(line.split()[1])
+    return {
+        "cpu_ns": cpu_ns,
+        "idle_wakeups": voluntary,
+        "interrupt_wakeups": involuntary,
+        "footprint": rss,
+        "disk_written": written,
+    }
+
+
+def probe_usage():
+    """Time the kernel spent in the probe's programs (needs bpf_stats_enabled)."""
+    out = subprocess.run(["bpftool", "prog", "show", "--json"], capture_output=True, text=True).stdout
+    progs = [p for p in json.loads(out or "[]") if p.get("name") in PROBE_PROGRAMS]
+    return {
+        "cpu_ns": sum(p.get("run_time_ns", 0) for p in progs),
+        "idle_wakeups": sum(p.get("run_cnt", 0) for p in progs),
+        "interrupt_wakeups": 0,
+        "footprint": 0,
+        "disk_written": 0,
+    }
+
+
+def mac_rusage(pid):
     """Cumulative counters for one process. CPU times are Mach ticks."""
     buf = (ctypes.c_uint64 * 64)()
     if LIBSYSTEM.proc_pid_rusage(pid, RUSAGE_INFO_V4, ctypes.byref(buf)) != 0:
@@ -54,6 +117,9 @@ def find_pids():
     ).stdout.split()
     if len(daemon) != 1:
         raise SystemExit(f"expected one netcheck daemon, found {daemon}")
+    if LINUX:
+        # The meter runs inside the daemon; its kernel side is the probe.
+        return {"daemon": int(daemon[0]), "probe": PROBE}
     meter = subprocess.run(
         ["pgrep", "-P", daemon[0]], capture_output=True, text=True
     ).stdout.split()
@@ -178,7 +244,11 @@ class Churn:
 
 def show(name, result):
     print(f"\n{name}")
-    print(f"  {'':8} {'CPU s/h':>9} {'idle wk/s':>10} {'intr wk/s':>10} {'disk KB/min':>12} {'MB':>6}")
+    if LINUX:
+        # daemon: voluntary / involuntary context switches; probe: program runs.
+        print(f"  {'':8} {'CPU s/h':>9} {'vol cs/s':>10} {'invol cs/s':>10} {'disk KB/min':>12} {'MB':>6}")
+    else:
+        print(f"  {'':8} {'CPU s/h':>9} {'idle wk/s':>10} {'intr wk/s':>10} {'disk KB/min':>12} {'MB':>6}")
     for proc, r in result.items():
         print(
             f"  {proc:8} {r['cpu_s_per_hour']:9.2f} {r['idle_wakeups_per_s']:10.2f} "
@@ -196,6 +266,13 @@ def main():
     args = parser.parse_args()
 
     pids = find_pids()
+    stats_flag = "/proc/sys/kernel/bpf_stats_enabled"
+    restore_stats = None
+    if LINUX:
+        with open(stats_flag) as f:
+            restore_stats = f.read().strip()
+        with open(stats_flag, "w") as f:
+            f.write("1")
     results = {"pids": pids, "seconds": {"idle": args.idle, "load": args.load}, "rate": args.rate}
     results["idle"] = measure(pids, args.idle)
     show(f"idle ({args.idle:.0f} s)", results["idle"])
@@ -211,6 +288,10 @@ def main():
         f"{churn.failed} failed ({args.load:.0f} s)",
         results["churn"],
     )
+    if LINUX:
+        with open(stats_flag, "w") as f:
+            f.write(restore_stats)
+        print("\nprobe: CPU is kernel time in the probe; vol cs/s is program runs per second.")
     if args.json:
         with open(args.json, "w") as f:
             json.dump(results, f, indent=2)

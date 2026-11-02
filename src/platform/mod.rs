@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{local_prefixes, on_stop_signal};
+pub use unix::{local_prefixes, on_stop_signal, wait_for_stop};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -23,7 +23,7 @@ pub use linux::{data_dir, install, uninstall, READER_GROUP};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{data_dir, install, local_prefixes, on_stop_signal, uninstall};
+pub use windows::{data_dir, install, local_prefixes, on_stop_signal, uninstall, wait_for_stop};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 

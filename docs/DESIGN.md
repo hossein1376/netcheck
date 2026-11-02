@@ -36,9 +36,21 @@ Memory is physical footprint. Wakeups are interrupt wakeups; package-idle wakeup
 
 Under connection churn the meter costs about 0.37 ms of CPU per new connection, roughly half user and half kernel time. The cadence and snapshot changes didn't touch that path. Profiling puts most of it outside netcheck's code, in NetworkStatistics' per-socket event handling.
 
+**Measured overhead (Linux, OrbStack machine, 2026-11-02):** the same script, run with `sudo`. The daemon is one process; the probe row is kernel time inside the eBPF programs (with `kernel.bpf_stats_enabled` on during the run). Wakeups are voluntary context switches.
+
+| Scenario | Daemon CPU s/hour | Probe CPU s/hour | Probe calls/s | Daemon wakeups/s | Daemon memory |
+| --- | --- | --- | --- | --- | --- |
+| Idle, 120 s | 0.30 | 0.02 | 3 | 0.13 | 6.1 MB |
+| Full-speed loopback stream, 60 s | 0.00 | 28.6 | 309,000 | 0.13 | 6.3 MB |
+| 200 short connections/s, 60 s | 3.6 | 4.9 | 1,000 | 0.13 | 7.3 MB |
+
+That's about 26 ns per hooked call and 12 µs of CPU per connection, roughly 30 times less than the macOS meter. The daemon's disk writes are higher than on macOS, 150–200 KB/min against 14–20; not yet investigated.
+
 ## Current state: macOS v1
 
 macOS v1 runs as a root LaunchDaemon (`com.netcheck.daemon`), so it sees every process's sockets. Its accounting was verified against known loopback transfers on 2026-11-01. Until then it ran as a per-user LaunchAgent, which only saw that user's processes (see the decision log).
+
+**Linux** is built and passes the same conformance suite, so far only in an OrbStack machine on the Mac (see Testing): an eBPF probe counts bytes per socket in the kernel, and `sudo netcheck install` sets up a systemd service with a `netcheck` reader group. It hasn't run on a real Linux host yet.
 
 | Command | What it does |
 | --- | --- |
@@ -158,20 +170,20 @@ Each socket's bytes go to one scope based on its remote address, and to one app 
 
 Each OS gets the one source that sees every socket, including UDP and connections shorter than a poll. On every OS that source needs root or admin to see other users' and system processes, so the daemon runs as a system service. Linux and Windows details are from API knowledge and haven't been prototyped.
 
-|  | macOS (shipped) | Linux (planned) | Windows (planned) |
+|  | macOS (shipped) | Linux (built; tested in OrbStack) | Windows (planned) |
 | --- | --- | --- | --- |
-| Source | NetworkStatistics (private framework) | eBPF: `tcp_sendmsg`, `tcp_cleanup_rbuf`, UDP send and receive paths | ETW `Microsoft-Windows-Kernel-Network` |
-| Data shape | Cumulative per socket | Per-event deltas, summed per socket in a BPF map | Per-event deltas, summed per connection |
+| Source | NetworkStatistics (private framework) | eBPF `fexit` on `tcp_sendmsg`, `tcp_recvmsg`, `udp_sendmsg`, `udp_recvmsg`, `udpv6_sendmsg`, `udpv6_recvmsg` | ETW `Microsoft-Windows-Kernel-Network` |
+| Data shape | Cumulative per socket | Bytes added per call into an LRU hash map keyed by socket cookie, read in one batch per snapshot | Per-event deltas, summed per connection |
 | Socket id | Meter counter | Socket cookie (unique per boot) | Meter counter per 5-tuple and PID |
-| Close signal | Removed callback | `inet_sock_set_state` to closed | Disconnect event |
+| Close signal | Removed callback | `fentry/inet_release` marks the entry closed; the daemon deletes it after reporting | Disconnect event |
 | Privilege | Root (as a user it sees only that user's processes) | Root (`CAP_BPF`, `CAP_PERFMON`) | Administrator |
-| Minimum | macOS 13+ assumed | Kernel 5.8+ with BTF | Windows 10 1809+ assumed |
+| Minimum | macOS 13+ assumed | Kernel with BTF and `bpf_get_func_ret`: 5.17+ on x86_64, 6.0+ on arm64. No kprobe fallback yet | Windows 10 1809+ assumed |
 | Runs as | LaunchDaemon | systemd system unit | Windows service |
-| Meter process | Separate (Objective-C) | In-process Rust loader; probe language open (decision 5) | In-process Rust; consumer design open (decision 6) |
+| Meter process | Separate (Objective-C) | In-process: probe in C (`meter/linux/netcheck.bpf.c`) loaded with `libbpf-rs` | In-process Rust; consumer design open (decision 6) |
 
 **Rejected sources:** Linux `sock_diag` polling (no UDP byte counters, misses short connections); Windows TCP ESTATS (TCP only, polled), WFP callout drivers (need a signed kernel driver), and SRUM (hourly and delayed).
 
-**Platform layer:** these pieces sit behind one small interface in `src/platform/`, with one module per OS. macOS is complete. The Linux and Windows modules are stubs that return "not supported yet", and they haven't been compiled for those targets. The instance lock uses `std::fs::File::try_lock` on every OS.
+**Platform layer:** these pieces sit behind one small interface in `src/platform/`, with one module per OS. macOS is complete. macOS and Linux are complete; Linux installs a systemd unit (`/etc/systemd/system/netcheck.service`, binary in `/usr/local/lib/netcheck`, linked from `/usr/local/bin`) and creates the `netcheck` group. The Windows module is a stub that returns "not supported yet" and hasn't been compiled. The instance lock uses `std::fs::File::try_lock` on every OS.
 
 | Concern | macOS | Linux | Windows |
 | --- | --- | --- | --- |
@@ -182,7 +194,7 @@ Each OS gets the one source that sees every socket, including UDP and connection
 | Instance lock | `flock` | `flock` | `LockFileEx` or a named mutex |
 | Stop signal | `SIGINT`, `SIGTERM` | `SIGINT`, `SIGTERM` | Service control handler |
 | Local subnets | `getifaddrs` | `getifaddrs` | `GetAdaptersAddresses` |
-| App grouping | `.app` bundle | systemd `app-*.scope`, Flatpak id | Package family name, service name |
+| App grouping | `.app` bundle | Not yet: executables are their own app (planned: systemd `app-*.scope`, Flatpak id) | Package family name, service name |
 
 **Platform-specific traps**
 
@@ -195,6 +207,8 @@ These are settled unless new evidence reopens them. Newest first.
 
 | When | Decision | Why | Rejected |
 | --- | --- | --- | --- |
+| Built 2026-11-02 | Linux meter: a C eBPF probe loaded in-process with `libbpf-rs`. `fexit` hooks read each call's return value with `bpf_get_func_ret` and add it to a per-socket entry in an LRU hash keyed by socket cookie; `inet_release` marks closes; a ring buffer reports each new process so its path is read while it exists; the daemon reads the map in one batch per snapshot | Counting in the kernel and reading every 10 s keeps wakeups near zero; measured at about 26 ns per hooked call and 12 µs per connection | `fentry` on `tcp_cleanup_rbuf` for receives, which runs twice in a blocking read with the cumulative count; reading the return as declared arguments, which breaks when a kernel changes the signature; Aya; a vendored `vmlinux.h` (minimal CO-RE struct definitions instead) |
+| Built 2026-11-02 | When the daemon runs in a nested PID namespace (a container, such as an OrbStack machine), the probe also records each process's PID in that namespace with `bpf_get_ns_current_pid_tgid` | The kernel's global PID doesn't exist in the daemon's `/proc` there, so paths failed and PIDs were wrong. On a normal host the daemon is in the root namespace and global PIDs are used | Always using global PIDs |
 | Built 2026-11-02 | macOS runs as a root LaunchDaemon, replacing the per-user LaunchAgent; install copies the old database | Probing showed NetworkStatistics as a user sees only that user's processes: 10 of 10 were the user's. As root it saw 21, including root, `_mdnsresponder` and `_netbios`. VPN daemons, DNS and system services were uncounted | Staying user-level |
 | Built 2026-11-02 | Each socket carries its effective process and its bytes split by link (Wi-Fi, wired, cellular); usage credits the effective process and stores the link split for apps and for the VPN tunnel | Contract changes are cheapest while there is one meter. NetworkStatistics reports `epid`, `euuid` and per-link counters | Only an interface flag per socket, which misreads sockets that move between links |
 | Built 2026-11-01 | Snapshot every 10 s, or every second for 60 s after a `top` request; one final snapshot on stop | The meter's 1 s timer was its main idle cost, and closed sockets wait for the next snapshot, so a slower cadence loses nothing | A fixed 1 s interval |
@@ -219,14 +233,13 @@ These are settled unless new evidence reopens them. Newest first.
 
 ## Open decisions
 
-Decisions 5 and 6 shape the meters, so settle them before each port. Decision 2 should be settled before the GUI starts, since it shapes the IPC API. The recommendations are proposals, not decisions.
+Decision 6 shapes the Windows meter, so settle it before that port. Decision 2 should be settled before the GUI starts, since it shapes the IPC API. The recommendations are proposals, not decisions.
 
 | # | Decision | Options | Recommendation | Blocks |
 | --- | --- | --- | --- | --- |
 | 2 | How the GUI reads data | Directly from SQLite; through a versioned daemon API over IPC | Daemon API, so the schema can change underneath | IPC design, GUI |
 | 3 | Configuration | Hard-coded defaults; a `netcheck.toml` in the data directory | TOML with per-OS defaults; add `tailscaled` and tunnel handling | Exclude list, retention |
 | 4 | Retention | Keep forever; roll up to daily totals after N days | Defer; revisit when the database passes about 50 MB | Nothing yet |
-| 5 | Linux probe language and hooks | C loaded with `libbpf-rs`; Rust with Aya (needs nightly and `bpf-linker`). Hooks: `fentry`, `kprobe`, or per-packet `cgroup_skb` | C with `libbpf-rs`; `fentry` on `tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp_sendmsg`, `udp_recvmsg`; per-socket counters in a BPF hash map keyed by socket cookie, read in one batch per interval; closed entries deleted only after they're read | Linux meter |
 | 6 | Windows ETW consumer | `ferrisetw` (decodes each event by schema lookup, TDH); the raw `windows` crate with fixed layouts parsed by hand. Source: the `Microsoft-Windows-Kernel-Network` provider or the classic kernel logger's TCP/IP flag | Raw `windows` crate, hand-parsed, TCP and UDP events only; choose the source by measuring both | Windows meter |
 
 ## Testing and verification
@@ -250,6 +263,28 @@ cargo test --release --test conformance -- --ignored --test-threads=1
 Cases 1–6 are automated and passed 10 runs in a row on macOS on 2026-11-01. Case 7 isn't automated yet. Reintroducing the old baseline bug makes the suite fail, so it does catch regressions.
 
 **CI:** deferred. The unit tests and each OS's conformance suite run locally. GitHub Actions runners can run eBPF (Ubuntu with `sudo`) and ETW (Windows as administrator) when CI is added.
+
+**Linux development environment:** an OrbStack machine on the Mac, `netcheck` (Ubuntu 24.04, arm64, created 2026-11-02). It runs OrbStack's kernel, 7.2.12, with BTF, the BPF JIT, direct-call ftrace (needed for `fentry`) and kprobes. Toolchain: Rust 1.99.1, clang 18, libbpf 1.3, and bpftool 7.4 from Ubuntu's `linux-tools-generic` (linked to `/usr/local/sbin/bpftool`). The repo is visible at the same path, and `orb` keeps the current directory, so run it from the repo on the Mac. Build with `CARGO_TARGET_DIR=$HOME/netcheck-target` so Linux and macOS builds stay apart:
+
+```bash
+orb -m netcheck sh -c 'CARGO_TARGET_DIR=$HOME/netcheck-target cargo test --release'
+```
+
+Findings from setting it up:
+
+- A first minimal `fexit` probe on `tcp_sendmsg` and `udp_sendmsg`, counting into a hash map keyed by socket cookie, loaded, attached, and counted 1,000,000 TCP and 50,000 UDP bytes exactly.
+- All planned hooks are traceable on this kernel: `tcp_sendmsg`, `tcp_recvmsg`, `tcp_cleanup_rbuf` (also present as `__tcp_cleanup_rbuf`), `udp_sendmsg`, `udp_recvmsg`, `udpv6_sendmsg`, `udpv6_recvmsg`. Socket close is the `sock/inet_sock_set_state` tracepoint. Hook names drift between kernels, so the meter should try alternatives.
+- The machine only sees its own traffic. That's enough for development and the conformance suite, but the meter must also pass on an older LTS kernel (5.15, 6.1 or 6.8) and on x86_64 before it ships, because OrbStack's kernel is far newer than most hosts.
+- OrbStack runs a few BPF programs of its own (`fexit` and LSM). They're unrelated to netcheck.
+- bpftool 7.4 is older than the kernel, so the generated `vmlinux.h` produces harmless "declaration does not declare anything" warnings.
+- An OrbStack machine is a container: its PID namespace isn't the root one, which is why the probe records namespace-local PIDs. Processes outside it (OrbStack's own `scon`, `krpc`, `nfsd`, which share the VM kernel) show up by process name only.
+
+On Linux the conformance suite needs root. Build it, then run the test binary with `sudo`; it passed 10 runs in a row. `meter::linux::tests::probe_counts_its_own_loopback_transfer` is a faster root-only check of the probe alone:
+
+```bash
+orb -m netcheck sh -c 'CARGO_TARGET_DIR=$HOME/netcheck-target cargo test --release --test conformance --no-run'
+orb -m netcheck sh -c 'sudo $(ls -t $HOME/netcheck-target/release/deps/conformance-* | grep -v "\.d$" | head -1) --ignored --test-threads=1'
+```
 
 **Overhead measurement:** CPU seconds per hour, wakeups per second, disk writes and memory for the daemon and meter. Three scenarios: idle, a full-speed loopback stream, and connection churn. On macOS, `scripts/overhead.py` reads each process's counters with `proc_pid_rusage`, which needs no root, and measures the installed agent:
 
@@ -277,3 +312,6 @@ The largest risk is that macOS depends on a private framework. The rest are boun
 | Stopping can take up to one idle interval | The daemon notices a stop only when the next snapshot arrives, up to 10 s; launchd allows 20 s | Acceptable for now. That snapshot already holds the last interval, so nothing is lost |
 
 | No metered flag observed | NetworkStatistics may report an "expensive" (metered) flag, but every socket here was on a VPN tunnel, so none showed it. Cellular bytes are stored; a hotspot over Wi-Fi isn't yet marked as metered | Check on a machine without a VPN, or on a hotspot |
+| Linux meter only tested in OrbStack | One very new kernel (7.2, arm64), and no real host's traffic | Run on an LTS kernel (5.15, 6.1 or 6.8) and on x86_64 before shipping |
+| No link split or effective process on Linux | The Linux probe doesn't report Wi-Fi, wired or cellular bytes, or delegated traffic; those columns stay zero | Add interface lookup to the probe if needed |
+| Linux daemon writes 150–200 KB/min to disk | Ten times the macOS figure | Investigate: SQLite page writes, checkpoints, or the status file |

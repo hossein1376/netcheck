@@ -2,6 +2,7 @@
 //! just one user's. Data lives in /Library/Application Support/netcheck and is
 //! readable by the admin group.
 
+use super::unix::{copy_exe, require_root};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -115,14 +116,6 @@ pub fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
-fn require_root(what: &str) -> Result<(), String> {
-    if unsafe { libc::geteuid() } == 0 {
-        Ok(())
-    } else {
-        Err(format!("{what} needs root: run it with sudo"))
-    }
-}
-
 /// Stop and remove the per-user agent of earlier versions for the user who ran
 /// sudo. Returns where its database was, if there was one.
 fn retire_user_agent() -> Option<PathBuf> {
@@ -155,28 +148,6 @@ fn copy_database(from: &Path, to: &Path) -> Result<(), String> {
     conn.execute("VACUUM INTO ?1", [to.display().to_string()])
         .map_err(|err| format!("copy {} to {}: {err}", from.display(), to.display()))?;
     Ok(())
-}
-
-fn copy_exe(src: &Path, dest: &Path) -> Result<(), String> {
-    if same_file(src, dest) {
-        return Ok(());
-    }
-    // Copy to a new file and rename over the old one. Writing into an executable
-    // that has run leaves macOS with a stale code signature for it, and the next
-    // launch is killed.
-    let tmp = dest.with_extension("new");
-    let _ = fs::remove_file(&tmp);
-    fs::copy(src, &tmp).map_err(|err| format!("copy {} failed: {err}", src.display()))?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).map_err(|err| err.to_string())?;
-    fs::rename(&tmp, dest).map_err(|err| format!("replace {} failed: {err}", dest.display()))?;
-    Ok(())
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 fn launchctl(args: &[&str]) -> Result<(), String> {

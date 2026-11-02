@@ -3,9 +3,15 @@
 //!
 //!     cargo test --release --test conformance -- --ignored --test-threads=1
 //!
+//! On Linux the meter needs root, so build it, then run the test binary with
+//! sudo (cargo prints its path):
+//!
+//!     cargo test --release --test conformance --no-run
+//!     sudo <conformance binary> --ignored --test-threads=1
+//!
 //! This test process predates the daemon it starts, like a long-running app.
 //! A copy of it started later plays a process that is newer than the daemon.
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use netcheck::{min_hour, By, Store, UsageRow};
 use std::io::{Read, Write};
