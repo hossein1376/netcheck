@@ -1,33 +1,11 @@
+//! NC02: how the macOS meter streams snapshots to the daemon. Other meters
+//! produce [`SocketCount`] directly.
+
+use super::{Proto, SocketCount};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const MAGIC: &[u8] = b"NC02";
-
-/// One cumulative socket counter from a meter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SocketCount {
-    /// Meter-assigned id. Unique for one meter run.
-    pub source: u64,
-    /// The socket opened after the meter started, so its counters are all new usage.
-    pub new: bool,
-    pub pid: u32,
-    pub start_time: u64,
-    pub proto: Proto,
-    pub name: String,
-    pub local: Option<SocketAddr>,
-    pub remote: Option<SocketAddr>,
-    pub rx: u64,
-    pub tx: u64,
-    /// Executable path, read by the meter when it first saw the socket.
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Proto {
-    Tcp,
-    Udp,
-}
 
 #[derive(Debug)]
 pub enum FrameError {
@@ -83,14 +61,6 @@ pub fn read_sample(reader: &mut impl Read) -> Result<Vec<SocketCount>, FrameErro
             Step::Done => return Ok(sockets),
         }
     }
-}
-
-pub fn hour_index(now: SystemTime) -> i64 {
-    let secs = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs() as i64;
-    secs.div_euclid(3600)
 }
 
 enum Step {

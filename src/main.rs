@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use netcheck::{
-    default_db_path, fetch_top, install, meter_path, min_hour, parse_since, run_daemon, status_path,
-    uninstall, Store, UsageRow,
+    default_db_path, fetch_top, min_hour, parse_since, platform, run_daemon, status_path, By, Store,
+    UsageRow,
 };
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -28,6 +28,9 @@ enum Cmd {
         since: String,
         #[arg(long)]
         app: Option<String>,
+        /// One row per executable instead of per app.
+        #[arg(long)]
+        by_exe: bool,
         #[arg(long)]
         json: bool,
     },
@@ -43,9 +46,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Install a LaunchAgent for this user.
+    /// Install the background service.
     Install,
-    /// Stop the LaunchAgent and remove its binaries.
+    /// Stop the background service and remove its binaries.
     Uninstall,
 }
 
@@ -60,10 +63,12 @@ fn main() {
             db,
             since,
             app,
+            by_exe,
             json,
         } => {
             let db = db.unwrap_or_else(default_db_path);
-            show_usage(&db, &since, app.as_deref(), json)
+            let by = if by_exe { By::Executable } else { By::App };
+            show_usage(&db, &since, app.as_deref(), by, json)
         }
         Cmd::Status { db } => {
             let db = db.unwrap_or_else(default_db_path);
@@ -76,8 +81,8 @@ fn main() {
         }
         Cmd::Install => std::env::current_exe()
             .map_err(|err| err.to_string())
-            .and_then(|bin| install(&bin, &meter_path(), &default_db_path())),
-        Cmd::Uninstall => uninstall(),
+            .and_then(|bin| platform::install(&bin, &default_db_path())),
+        Cmd::Uninstall => platform::uninstall(),
     };
     if let Err(err) = result {
         eprintln!("{err}");
@@ -89,12 +94,13 @@ fn show_usage(
     db: &std::path::Path,
     since: &str,
     app: Option<&str>,
+    by: By,
     json: bool,
 ) -> Result<(), String> {
     let start = parse_since(since, SystemTime::now())?;
-    let store = Store::open_read(db).map_err(|_| format!("no database at {}", db.display()))?;
+    let store = Store::open_read(db)?;
     let rows = store
-        .usage(min_hour(start), app)
+        .usage(min_hour(start), app, by)
         .map_err(|err| err.to_string())?;
     if json {
         let body: Vec<UsageJson> = rows
@@ -118,7 +124,7 @@ fn show_usage(
     for row in &rows {
         println!(
             "{:<24} {:>14} {:>14} {:>12} {:>12} {:>12} {:>12}",
-            clip(&row.display_name, 24),
+            clip(&row.name, 24),
             fmt_bytes(row.internet_rx),
             fmt_bytes(row.internet_tx),
             fmt_bytes(row.local_rx),
@@ -149,7 +155,7 @@ fn show_top(db: &std::path::Path, json: bool) -> Result<(), String> {
     for row in &report.rows {
         println!(
             "{:<24} {:>12} {:>12} {:>12} {:>12}",
-            clip(&row.display_name, 24),
+            clip(&row.name, 24),
             fmt_bytes(row.rx),
             fmt_bytes(row.tx),
             fmt_bytes(row.rx / secs),
@@ -166,10 +172,13 @@ fn show_status(db: &std::path::Path) {
         Ok(text) => println!("{text}"),
         Err(_) => println!("daemon: not running"),
     }
-    if let Ok(store) = Store::open_read(db) {
-        if let Ok(rows) = store.hour_rows() {
-            println!("stored hour rows: {rows}");
+    match Store::open_read(db) {
+        Ok(store) => {
+            if let Ok(rows) = store.hour_rows() {
+                println!("stored hour rows: {rows}");
+            }
         }
+        Err(err) => println!("{err}"),
     }
 }
 

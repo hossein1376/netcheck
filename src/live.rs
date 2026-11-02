@@ -6,8 +6,9 @@ const WINDOW_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct TopRow {
-    pub app_key: String,
-    pub display_name: String,
+    /// The app's group key. See `group_of`.
+    pub key: String,
+    pub name: String,
     pub rx: u64,
     pub tx: u64,
 }
@@ -47,8 +48,8 @@ impl LiveWindow {
                     return None;
                 }
                 Some(TopRow {
-                    app_key: app.app_key.clone(),
-                    display_name: app.display_name.clone(),
+                    key: app.group_key.clone(),
+                    name: app.group_name.clone(),
                     rx,
                     tx,
                 })
@@ -66,13 +67,13 @@ impl LiveWindow {
         let mut totals: HashMap<String, TopRow> = HashMap::new();
         for tick in &self.ticks {
             for row in &tick.rows {
-                let total = totals.entry(row.app_key.clone()).or_insert_with(|| TopRow {
-                    app_key: row.app_key.clone(),
-                    display_name: row.display_name.clone(),
+                let total = totals.entry(row.key.clone()).or_insert_with(|| TopRow {
+                    key: row.key.clone(),
+                    name: row.name.clone(),
                     rx: 0,
                     tx: 0,
                 });
-                total.display_name = row.display_name.clone();
+                total.name = row.name.clone();
                 total.rx += row.rx;
                 total.tx += row.tx;
             }
@@ -82,7 +83,7 @@ impl LiveWindow {
             None => WINDOW_SECS,
         };
         let mut rows: Vec<TopRow> = totals.into_values().collect();
-        rows.sort_by(|a, b| (b.rx + b.tx).cmp(&(a.rx + a.tx)).then(a.display_name.cmp(&b.display_name)));
+        rows.sort_by(|a, b| (b.rx + b.tx).cmp(&(a.rx + a.tx)).then(a.name.cmp(&b.name)));
         TopReport { window_secs, rows }
     }
 
@@ -106,6 +107,8 @@ mod tests {
         AppDelta {
             app_key: format!("/usr/bin/{name}"),
             display_name: name.into(),
+            group_key: format!("/usr/bin/{name}"),
+            group_name: name.into(),
             hour: 1,
             buckets: Buckets {
                 internet_rx: rx,
@@ -135,6 +138,22 @@ mod tests {
         let report = live.snapshot(1_101);
         assert_eq!(report.window_secs, 60);
         assert_eq!(report.rows[0].rx, 6_000);
+    }
+
+    #[test]
+    fn helpers_add_up_under_their_app() {
+        let mut live = LiveWindow::new();
+        let mut helper = delta("Claude Helper", 30, 0);
+        helper.group_key = "/Applications/Claude.app".into();
+        helper.group_name = "Claude".into();
+        let mut main = delta("Claude", 70, 0);
+        main.group_key = "/Applications/Claude.app".into();
+        main.group_name = "Claude".into();
+        live.push(1_000, &[helper, main]);
+        let report = live.snapshot(1_000);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].name, "Claude");
+        assert_eq!(report.rows[0].rx, 100);
     }
 
     #[test]

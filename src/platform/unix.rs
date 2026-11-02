@@ -1,5 +1,21 @@
+//! Pieces shared by macOS and Linux.
+
+use super::STOP;
 use crate::classify::Prefix;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::Ordering;
+
+extern "C" fn handle_stop(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// Set the stop flag on SIGINT and SIGTERM.
+pub fn on_stop_signal() {
+    unsafe {
+        libc::signal(libc::SIGINT, handle_stop as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handle_stop as *const () as libc::sighandler_t);
+    }
+}
 
 /// Prefixes of addresses configured on this machine.
 pub fn local_prefixes() -> Vec<Prefix> {

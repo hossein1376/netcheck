@@ -31,6 +31,7 @@ extern CFStringRef kNStatSrcKeyTxBytes;
 extern CFStringRef kNStatSrcKeyLocal;
 extern CFStringRef kNStatSrcKeyRemote;
 extern CFStringRef kNStatSrcKeyProvider;
+extern CFStringRef kNStatSrcKeyUUID;
 
 // Our own keys in each merged source dictionary.
 static NSString *const kNCNew = @"netcheck.new";
@@ -40,6 +41,9 @@ static NSString *const kNCPath = @"netcheck.path";
 // Source id -> merged description and counts. Ids are never reused in a run.
 static NSMutableDictionary *g_events;
 static NSMutableSet *g_closing;
+// Executable UUID -> path, learned from live processes. Names the binary of a
+// process that exited before the meter could look it up.
+static NSMutableDictionary *g_paths;
 static uint64_t g_next_id = 0;
 // Sources added before the first snapshot existed before the meter started.
 static BOOL g_baselined = NO;
@@ -60,10 +64,16 @@ static void note_process(NSMutableDictionary *event) {
         start = info.pbi_start_tvsec;
     }
     NSString *path = @"";
+    id uuid = event[(__bridge NSString *)kNStatSrcKeyUUID];
     char buf[PROC_PIDPATHINFO_MAXSIZE];
     int n = proc_pidpath(pid, buf, sizeof(buf));
     if (n > 0) {
         path = [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
+        if (uuid != nil && path.length > 0) {
+            g_paths[uuid] = path;
+        }
+    } else if (uuid != nil) {
+        path = g_paths[uuid] ?: @"";
     }
     event[kNCStart] = @(start);
     event[kNCPath] = path;
@@ -239,6 +249,7 @@ int main(int argc, char **argv) {
         signal(SIGPIPE, SIG_IGN);
         g_events = [NSMutableDictionary dictionary];
         g_closing = [NSMutableSet set];
+        g_paths = [NSMutableDictionary dictionary];
 
         dispatch_queue_t queue = dispatch_queue_create("netcheck.nstat", DISPATCH_QUEUE_SERIAL);
         NStatManagerRef manager = NStatManagerCreate(kCFAllocatorDefault, queue,

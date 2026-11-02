@@ -1,4 +1,4 @@
-use crate::frame::SocketCount;
+use crate::meter::SocketCount;
 use std::collections::{HashMap, HashSet};
 
 /// A meter source. Ids are unique within one meter run.
@@ -79,7 +79,7 @@ impl Diff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::Proto;
+    use crate::meter::Proto;
 
     fn sock(rx: u64, tx: u64) -> SocketCount {
         SocketCount {

@@ -1,9 +1,18 @@
+//! macOS: a per-user LaunchAgent with data under Application Support.
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const LABEL: &str = "com.netcheck.agent";
+
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/Application Support/netcheck")
+}
 
 pub fn render_plist(bin: &Path, db: &Path, log: &Path) -> String {
     format!(
@@ -58,12 +67,13 @@ pub fn write_install(home: &Path, src_bin: &Path, src_meter: &Path, db: &Path) -
     Ok(plist_path)
 }
 
-pub fn install(src_bin: &Path, src_meter: &Path, db: &Path) -> Result<(), String> {
+pub fn install(src_bin: &Path, db: &Path) -> Result<(), String> {
+    let src_meter = crate::meter::meter_path();
     println!("Installs a LaunchAgent for this user. It starts at login and restarts if it exits.");
     let home = home_dir()?;
     // Stop the old agent before its binaries are replaced.
     let _ = bootout(&home.join(format!("Library/LaunchAgents/{LABEL}.plist")));
-    let plist = write_install(&home, src_bin, src_meter, db)?;
+    let plist = write_install(&home, src_bin, &src_meter, db)?;
     bootstrap(&plist)?;
     kickstart()?;
     println!("loaded {}", plist.display());

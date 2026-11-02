@@ -30,7 +30,7 @@ macOS v1 is running as a per-user LaunchAgent, and its accounting was verified a
 | Command | What it does |
 | --- | --- |
 | `netcheck daemon` | Runs the meter and records usage (started by the LaunchAgent) |
-| `netcheck usage --since 24h [--app X] [--json]` | Hourly totals per app, overlapping the window |
+| `netcheck usage --since 24h [--app X] [--by-exe] [--json]` | Hourly totals per app (helpers included), or per executable with `--by-exe` |
 | `netcheck top [--json]` | Off-machine usage over the last 60 s, read from the daemon over a Unix socket |
 | `netcheck status` | Meter state, last sample and flush times, stored row count |
 | `netcheck install` / `uninstall` | Installs or removes the LaunchAgent and its binaries |
@@ -104,14 +104,15 @@ Usage is stored as per-app hourly buckets in SQLite (WAL, `synchronous=NORMAL`),
 
 | Table | Key | Columns |
 | --- | --- | --- |
-| `app` | `id`; `app_key` unique | `display_name` |
+| `app` | `id`; `app_key` unique | `display_name`, `group_key` (indexed), `group_name` |
 | `usage_hour` | (`app_id`, `hour_utc`) | `internet_rx/tx`, `local_rx/tx`, `unscoped_rx/tx` (bytes) |
 | `encapsulation_hour` | `hour_utc` | `rx`, `tx`: VPN tunnel bytes kept out of app totals |
 
-- **App identity:** `app_key` is the executable path. With no path, it's `name:<process name>`, so short-lived processes still group. 21 older `pid:<pid>:<start>` rows from before `315d2aa` remain.
+- **App identity:** `app_key` is the executable path. With no path, it's `name:<process name>`, so short-lived processes still group. 21 older `pid:<pid>:<start>` rows from before `315d2aa` remain and are grouped by process name.
+- **App grouping:** `group_key` is the outermost `.app` or `.appex` bundle in the path, so helpers count toward their app (`/Applications/Claude.app` → Claude). Other executables are their own group. Grouping rules for Linux and Windows aren't written yet. `usage` and `top` show groups; `usage --by-exe` shows executables.
 - **Durability:** deltas are merged in memory per app and hour, then written every 30 s in one transaction. A failed write keeps them for the next try. Up to 30 s is lost on a crash or `SIGKILL`.
 - **Off-machine** = internet + unscoped. It's what `top` shows and what the default `usage` sort uses.
-- **No schema versioning yet.** Tables are created with `CREATE TABLE IF NOT EXISTS`, and there's no migration path. Adding `PRAGMA user_version` with ordered migrations is decided, not yet built.
+- **Schema versioning:** the version lives in `PRAGMA user_version` (currently 2). The daemon applies ordered migrations on start, each in its own transaction. The CLI opens read-only and refuses an old schema with "restart the daemon". v1 is the original tables; v2 adds the group columns and fills them for existing rows.
 - **No retention policy.** At roughly 100 apps × 24 hours, that's about 2,400 small rows a day, so growth is slow but unbounded.
 
 ## Classification and attribution
@@ -129,7 +130,7 @@ Each socket's bytes go to one scope based on its remote address, and to one app 
 
 **Known attribution gaps**
 
-- **Helper processes:** an app's helpers are separate executables, so they show up as separate apps (Claude Helper, Bitwarden Helper, Grok Bot Helper).
+- **Helper processes outside bundles:** helpers inside an `.app` now group with it on macOS, but standalone binaries and Linux and Windows processes don't group yet.
 - **Delegated traffic:** some apps hand networking to another process, such as Safari to `com.apple.WebKit.Networking` or background transfers to `nsurlsessiond`. NStat reports an effective PID that could credit the right app; it isn't used yet.
 - **Shared interpreters:** every Python or Node script lands under one interpreter row.
 - **CGNAT and Tailscale:** peers in `100.64.0.0/10` count as internet, and they're double-counted against `tailscaled`'s own sockets. `tailscaled` isn't on the exclude list.
@@ -152,7 +153,7 @@ Each OS gets the one source that sees every socket, including UDP and connection
 
 **Rejected sources:** Linux `sock_diag` polling (no UDP byte counters, misses short connections); Windows TCP ESTATS (TCP only, polled), WFP callout drivers (need a signed kernel driver), and SRUM (hourly and delayed).
 
-**Platform layer:** these pieces sit behind one small interface, with one module per OS.
+**Platform layer:** these pieces sit behind one small interface in `src/platform/`, with one module per OS. macOS is complete. The Linux and Windows modules are stubs that return "not supported yet", and they haven't been compiled for those targets. The instance lock uses `std::fs::File::try_lock` on every OS.
 
 | Concern | macOS | Linux | Windows |
 | --- | --- | --- | --- |
@@ -178,8 +179,9 @@ These are settled unless new evidence reopens them. Newest first.
 | Decided 2026-11-01 | Lowest runtime overhead decides between designs; other languages (C or others) are allowed where they lower it | A native, low-overhead daemon is the product goal | A single-language codebase as a constraint |
 | Decided 2026-11-01 | No CI for now; the conformance suite runs locally | Not worth the setup at this stage | A GitHub Actions matrix |
 | Decided 2026-11-01, not built | Linux and Windows run as a system service with a system-wide database readable by a `netcheck` group; IPC checks peer credentials. macOS stays a per-user LaunchAgent | eBPF and ETW need root or admin; a group keeps reads off root without a second process | Privileged meter feeding a per-user daemon; root-only reads |
-| Decided 2026-11-01, not built | Linux and Windows meters run in-process behind a `Meter` trait; the macOS subprocess becomes one implementation of it | Privilege separation was the main reason for a separate process, and the service model doesn't need it | A separate meter process on every OS |
-| Decided 2026-11-01, not built | Schema versioning with `PRAGMA user_version` and ordered migrations, plus a `group_key` column set at write beside the raw `app_key` | Only one database to migrate today; the GUI needs grouping | Grouping applied at query time only |
+| Built 2026-11-01 | The macOS meter records each executable's UUID with its path, and uses it to name processes that exit before their path can be read | The conformance suite showed a process living under one poll lost its path in 2 of 3 runs | A process-name lookup, which can't tell two binaries with the same name apart |
+| Built 2026-11-01 (macOS) | Linux and Windows meters run in-process behind a `Meter` trait; the macOS subprocess becomes one implementation of it | Privilege separation was the main reason for a separate process, and the service model doesn't need it | A separate meter process on every OS |
+| Built 2026-11-01 | Schema versioning with `PRAGMA user_version` and ordered migrations, plus a `group_key` column set at write beside the raw `app_key` | Only one database to migrate today; the GUI needs grouping | Grouping applied at query time only |
 | Decided 2026-11-01 | Linux is the next platform, then Windows | eBPF matches the meter contract directly, and Ubuntu CI runners can run it with `sudo` | Windows first |
 | `315d2aa` | Key flows by meter source id, not by address tuple | Addresses change during a socket's life; a tuple key split or dropped flows | 5-tuple plus PID key |
 | `315d2aa` | The meter flags sockets opened after its first snapshot as `new`; the daemon bills their full counters | Only sockets that predate the meter need a baseline; the old rule lost short connections from long-running apps | Baseline every first sight; bill by process start time |
@@ -209,9 +211,13 @@ Decisions 5–8 shape the meters, so settle them before the first port. Decision
 
 ## Testing and verification
 
-The core has 30 unit tests with synthetic samples. What's missing is a test every meter must pass against real traffic. That's the only way to tell a new meter is correct rather than plausible.
+The core has 36 unit tests with synthetic samples. Every meter must also pass the conformance suite in `tests/conformance.rs`: real loopback traffic through a real daemon, checked to the byte. It's ignored by default because it takes about 6 s and needs the OS meter:
 
-**Meter conformance suite** (loopback only, temp database, run as an integration test or `netcheck selftest`):
+```bash
+cargo test --release --test conformance -- --ignored --test-threads=1
+```
+
+**Cases:**
 
 1. Short connections from a process that predates the daemon are counted in full, on both client and server.
 2. A connection already transferring at daemon start is billed only for bytes after start.
@@ -221,7 +227,7 @@ The core has 30 unit tests with synthetic samples. What's missing is a test ever
 6. A second daemon on the same database is refused.
 7. Killing the meter mid-run causes no double counting after it restarts.
 
-Cases 1, 2, 3 and 6 were run by hand on macOS on 2026-11-01 and passed.
+Cases 1–6 are automated and passed 10 runs in a row on macOS on 2026-11-01. Case 7 isn't automated yet. Reintroducing the old baseline bug makes the suite fail, so it does catch regressions.
 
 **CI:** deferred. The unit tests and each OS's conformance suite run locally. GitHub Actions runners can run eBPF (Ubuntu with `sudo`) and ETW (Windows as administrator) when CI is added.
 
@@ -236,7 +242,8 @@ The largest risk is that macOS depends on a private framework. The rest are boun
 | NetworkStatistics is private and undocumented | A macOS update could break or change it without notice | Conformance suite run on each macOS beta; meter failures show in `status` |
 | Sockets opened in the meter's first second are baselined | A small undercount at every daemon or meter start | Acceptable; could be narrowed with a socket start time if NStat exposes one |
 | Up to 30 s of deltas lost on a crash or `SIGKILL` | Small undercount | Shorter flush interval if needed |
-| Bytes after the last poll of a closing socket | Not verified: NStat may or may not deliver final counts on removal | Add to the conformance suite |
-| Attribution gaps (helpers, delegated traffic, interpreters, CGNAT) | Usage credited to the wrong row, or counted twice for Tailscale | App grouping (decided); open decisions 1 and 3 |
+| Bytes after the last poll of a closing socket | Checked on macOS: short TCP connections are counted to the byte by the conformance suite | Keep the case in the suite for every meter |
+| A binary's first run exits before its path is read | Recorded under `name:<process>` until the meter has seen that binary alive once | UUID cache in the meter; the cache resets when the meter restarts |
+| Attribution gaps (helpers, delegated traffic, interpreters, CGNAT) | Usage credited to the wrong row, or counted twice for Tailscale | App grouping (built for macOS bundles); open decisions 1 and 3 |
 | eBPF and ETW need root or admin | A different install and trust model from macOS | Decided: system service with a `netcheck` group |
 | ETW event loss under load | Undercount on busy Windows machines | Report lost events in `status` |

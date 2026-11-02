@@ -1,15 +1,33 @@
+//! The daemon's local API: `top` over a Unix socket. Windows will use a named
+//! pipe; until then these calls fail there.
+
 use crate::live::{LiveWindow, TopReport};
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn socket_path(db: &Path) -> PathBuf {
     db.with_file_name("netcheck.sock")
 }
 
+#[cfg(not(unix))]
+pub fn serve(_db: &Path, _live: Arc<Mutex<LiveWindow>>) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn fetch_top(_db: &Path) -> Result<TopReport, String> {
+    Err("top is not supported on this OS yet".into())
+}
+
+#[cfg(unix)]
 pub fn serve(db: &Path, live: Arc<Mutex<LiveWindow>>) -> Result<(), String> {
     let path = socket_path(db);
     if let Some(parent) = path.parent() {
@@ -33,6 +51,7 @@ pub fn serve(db: &Path, live: Arc<Mutex<LiveWindow>>) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub fn fetch_top(db: &Path) -> Result<TopReport, String> {
     let path = socket_path(db);
     let mut stream = UnixStream::connect(&path).map_err(|_| "daemon is not running".to_string())?;
@@ -52,6 +71,7 @@ pub fn fetch_top(db: &Path) -> Result<TopReport, String> {
     serde_json::from_str(body.trim()).map_err(|err| format!("bad top reply: {err}"))
 }
 
+#[cfg(unix)]
 fn handle(mut stream: UnixStream, live: &Mutex<LiveWindow>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = [0u8; 32];
@@ -73,7 +93,7 @@ fn handle(mut stream: UnixStream, live: &Mutex<LiveWindow>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::engine::{AppDelta, Buckets};
@@ -95,6 +115,8 @@ mod tests {
             &[AppDelta {
                 app_key: "/usr/bin/curl".into(),
                 display_name: "curl".into(),
+                group_key: "/usr/bin/curl".into(),
+                group_name: "curl".into(),
                 hour: 1,
                 buckets: Buckets {
                     internet_rx: 40,
@@ -105,7 +127,7 @@ mod tests {
         );
         serve(&db, Arc::clone(&live)).unwrap();
         let report = fetch_top(&db).expect("top");
-        assert_eq!(report.rows[0].display_name, "curl");
+        assert_eq!(report.rows[0].name, "curl");
         assert_eq!(report.rows[0].rx, 40);
         let _ = std::fs::remove_dir_all(&root);
     }

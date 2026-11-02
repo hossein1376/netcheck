@@ -3,8 +3,9 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UsageRow {
-    pub app_key: String,
-    pub display_name: String,
+    /// Group key or `app_key`, depending on how the rows were grouped.
+    pub key: String,
+    pub name: String,
     pub internet_rx: u64,
     pub internet_tx: u64,
     pub local_rx: u64,

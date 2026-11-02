@@ -1,10 +1,20 @@
 use crate::classify::{classify, Prefix, Scope};
 use crate::diff::Diff;
-use crate::frame::{hour_index, SocketCount};
+use crate::group::group_of;
+use crate::meter::SocketCount;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Hours since the Unix epoch, UTC.
+pub fn hour_index(now: SystemTime) -> i64 {
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
+    secs.div_euclid(3600)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Buckets {
@@ -48,6 +58,9 @@ impl Buckets {
 pub struct AppDelta {
     pub app_key: String,
     pub display_name: String,
+    /// The app this executable belongs to. See [`group_of`].
+    pub group_key: String,
+    pub group_name: String,
     pub hour: i64,
     pub buckets: Buckets,
 }
@@ -118,11 +131,16 @@ impl Engine {
 
         let apps = by_app
             .into_iter()
-            .map(|((app_key, display_name), buckets)| AppDelta {
-                app_key,
-                display_name,
-                hour,
-                buckets,
+            .map(|((app_key, display_name), buckets)| {
+                let (group_key, group_name) = group_of(&app_key, &display_name);
+                AppDelta {
+                    app_key,
+                    display_name,
+                    group_key,
+                    group_name,
+                    hour,
+                    buckets,
+                }
             })
             .collect();
         (apps, encap_rx, encap_tx)
@@ -174,8 +192,7 @@ fn is_excluded(exclude: &HashSet<String>, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::Proto;
-    use std::time::Duration;
+    use crate::meter::Proto;
 
     fn at(secs: u64) -> SystemTime {
         std::time::UNIX_EPOCH + Duration::from_secs(secs)
